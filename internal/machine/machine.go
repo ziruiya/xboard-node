@@ -52,6 +52,12 @@ type Orchestrator struct {
 	// for sync.nodes events without blocking the main loop.
 	runCtx context.Context
 
+	// relayDone is closed when the relay manager's Run returns (after
+	// its shutdown flush). NODE-009: Run waits for it so the process
+	// cannot exit — or a hot reload start a second manager on the
+	// same relay state path — before the final flush lands.
+	relayDone chan struct{}
+
 	pullInterval time.Duration
 	pushInterval time.Duration
 }
@@ -92,7 +98,11 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	// nodes. It stays completely idle until the panel publishes a relay
 	// config for this machine and enables it there.
 	relayMgr := relay.NewManager(o.client, o.cfg.Machine.MachineID, o.cfg.Kernel.ConfigDir)
-	go relayMgr.Run(ctx)
+	o.relayDone = make(chan struct{})
+	go func() {
+		defer close(o.relayDone)
+		relayMgr.Run(ctx)
+	}()
 
 	// Start initial nodes.
 	for _, n := range nodesResp.Nodes {
@@ -108,6 +118,14 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			o.stopAll()
+			// NODE-009: the relay manager performs its final traffic
+			// flush after its loops see the cancelled context (it
+			// bounds that flush itself). Wait for it so shutdown and
+			// hot reload never race a second manager on the same
+			// state file, and the last batches are not abandoned.
+			if o.relayDone != nil {
+				<-o.relayDone
+			}
 			return nil
 
 		case <-discoveryTicker.C:

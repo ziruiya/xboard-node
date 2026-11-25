@@ -121,6 +121,13 @@ func ComputeHash(nc *model.NodeSpec, users []model.UserSpec) string {
 // UserDiff computes which users to add and which to remove when transitioning
 // from oldUsers to newUsers. This is a pure helper used by callers; kernels
 // may also use it internally.
+//
+// A credential rotation (same ID, different UUID) appears in BOTH
+// lists — the old identity in toRemove, the new one in toAdd — because
+// kernels that key users by an ID-derived identity (xray's email)
+// cannot replace a credential by adding over it (NODE-013): the add
+// collides with the still-present old credential and the old one
+// silently stays valid.
 func UserDiff(oldUsers, newUsers []model.UserSpec) (toAdd, toRemove []model.UserSpec) {
 	oldMap := make(map[int]model.UserSpec, len(oldUsers))
 	for _, u := range oldUsers {
@@ -138,7 +145,8 @@ func UserDiff(oldUsers, newUsers []model.UserSpec) (toAdd, toRemove []model.User
 		}
 	}
 	for _, u := range oldUsers {
-		if _, exists := newMap[u.ID]; !exists {
+		nu, exists := newMap[u.ID]
+		if !exists || nu.UUID != u.UUID {
 			toRemove = append(toRemove, u)
 		}
 	}

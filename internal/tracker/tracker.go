@@ -4,7 +4,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -74,6 +76,11 @@ type Tracker struct {
 	// acknowledged. It is re-sent verbatim and never merged with new
 	// samples. Protected by mu.
 	unacked *Batch
+
+	// storePath, when set via EnablePersistence, is where the
+	// unacknowledged batch is persisted so a process restart can
+	// resend it with its original ID (SB-TA-010). Protected by mu.
+	storePath string
 
 	// batchSeq disambiguates batch IDs generated in the same process;
 	// idPrefix is a per-process random component. Protected by mu.
@@ -215,6 +222,7 @@ func (t *Tracker) FlushBatch() *Batch {
 func (t *Tracker) SetUnacked(b *Batch) {
 	t.mu.Lock()
 	t.unacked = b
+	t.persistUnackedLocked()
 	t.mu.Unlock()
 }
 
@@ -233,9 +241,85 @@ func (t *Tracker) AckBatch(id string) bool {
 	defer t.mu.Unlock()
 	if t.unacked != nil && t.unacked.ID == id {
 		t.unacked = nil
+		t.persistUnackedLocked()
 		return true
 	}
 	return false
+}
+
+// batchStore is the on-disk form of an unacknowledged batch.
+type batchStore struct {
+	ID            string           `json:"id"`
+	CollectedFrom int64            `json:"collected_from"`
+	CollectedTo   int64            `json:"collected_to"`
+	Data          map[int][2]int64 `json:"data"`
+}
+
+// EnablePersistence restores a batch a previous process left
+// unacknowledged and persists future unacknowledged batches to path
+// (SB-TA-010). Before this, the unacked batch lived only in memory:
+// any restart — including the routine shutdown flush racing a panel
+// outage — silently lost the last window of traffic. The restored
+// batch keeps its original ID, so the panel's (node, batch ID) dedup
+// books it exactly once even if the original send actually landed.
+//
+// Persistence is best-effort: failures are logged and reporting
+// continues in memory, exactly as before.
+func (t *Tracker) EnablePersistence(path string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.storePath = path
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return // no leftover batch (the common case)
+	}
+	var bs batchStore
+	if err := json.Unmarshal(raw, &bs); err != nil || bs.ID == "" || len(bs.Data) == 0 {
+		nlog.Core().Warn("tracker: ignoring unreadable persisted traffic batch", "path", path)
+		return
+	}
+	if t.unacked == nil {
+		t.unacked = &Batch{
+			ID:            bs.ID,
+			CollectedFrom: bs.CollectedFrom,
+			CollectedTo:   bs.CollectedTo,
+			Data:          bs.Data,
+		}
+		nlog.Core().Info("tracker: restored unacknowledged traffic batch from disk", "batch", bs.ID, "users", len(bs.Data))
+	}
+}
+
+// persistUnackedLocked writes the current unacked batch to the store
+// path (or removes the file once nothing is outstanding). Caller
+// holds mu.
+func (t *Tracker) persistUnackedLocked() {
+	if t.storePath == "" {
+		return
+	}
+	if t.unacked == nil {
+		if err := os.Remove(t.storePath); err != nil && !os.IsNotExist(err) {
+			nlog.Core().Warn("tracker: failed to remove persisted traffic batch", "error", err)
+		}
+		return
+	}
+	raw, err := json.Marshal(batchStore{
+		ID:            t.unacked.ID,
+		CollectedFrom: t.unacked.CollectedFrom,
+		CollectedTo:   t.unacked.CollectedTo,
+		Data:          t.unacked.Data,
+	})
+	if err != nil {
+		nlog.Core().Warn("tracker: failed to encode traffic batch for persistence", "error", err)
+		return
+	}
+	tmp := t.storePath + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		nlog.Core().Warn("tracker: failed to persist traffic batch", "error", err)
+		return
+	}
+	if err := os.Rename(tmp, t.storePath); err != nil {
+		nlog.Core().Warn("tracker: failed to persist traffic batch", "error", err)
+	}
 }
 
 // RestoreTraffic adds traffic back (used when push to panel fails).

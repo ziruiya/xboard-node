@@ -278,6 +278,20 @@ func (m *Manager) Start(ctx context.Context) error {
 	case "http":
 		return m.startACME(ctx, nil)
 	case "dns":
+		if isIPLiteral(m.cfg.Domain) {
+			// SB-ER-010 (agent half): the panel's dedicated-machine
+			// provisioner writes the machine's bare IP as the cert
+			// "domain" (CertCredentialReference::dnsCertConfig(IP)).
+			// DNS-01 cannot validate an IP identifier — there is no
+			// DNS zone for an IP, and Let's Encrypt offers no DNS-01
+			// challenge for IP certs — so building the solver (which
+			// also hard-fails when the panel shape carries no dns_env)
+			// only ever produced doomed issuance attempts. IP
+			// certificates are issued via HTTP-01 under the ACME
+			// "shortlived" profile; startACME selects that plan.
+			nlog.Core().Info("cert: dns mode with IP-literal domain, using ACME IP issuance (shortlived profile, http-01)", "ip", m.cfg.Domain)
+			return m.startACME(ctx, nil)
+		}
 		solver, err := m.buildDNSSolver()
 		if err != nil {
 			return fmt.Errorf("build dns solver: %w", err)
@@ -437,28 +451,8 @@ func (m *Manager) startACME(ctx context.Context, dnsSolver *certmagic.DNS01Solve
 		},
 	})
 
-	issuer := certmagic.ACMEIssuer{
-		CA:    certmagic.LetsEncryptProductionCA,
-		Email: m.cfg.Email,
-	}
-
-	if dnsSolver != nil {
-		// DNS-01 mode: no HTTP port needed, supports wildcards.
-		issuer.DNS01Solver = dnsSolver
-		issuer.DisableHTTPChallenge = true
-		issuer.DisableTLSALPNChallenge = true
-	} else {
-		// HTTP-01 mode.
-		httpPort := m.cfg.HTTPPort
-		if httpPort == 0 {
-			httpPort = 80
-		}
-		issuer.AltHTTPPort = httpPort
-		issuer.DisableTLSALPNChallenge = true
-	}
-
 	magic.Issuers = []certmagic.Issuer{
-		certmagic.NewACMEIssuer(magic, issuer),
+		certmagic.NewACMEIssuer(magic, m.buildACMEIssuer(dnsSolver)),
 	}
 	m.magic = magic
 
@@ -485,6 +479,47 @@ func (m *Manager) startACME(ctx context.Context, dnsSolver *certmagic.DNS01Solve
 	m.acmeFingerprint = acmeFingerprint(m.cfg)
 	m.acmeStarted = true
 	return nil
+}
+
+// isIPLiteral reports whether a configured cert "domain" is actually
+// a bare IP address (SB-ER-010: the dedicated-machine provisioner
+// writes the machine IP there).
+func isIPLiteral(name string) bool {
+	return net.ParseIP(strings.TrimSpace(name)) != nil
+}
+
+// buildACMEIssuer assembles the ACME issuer for the configured plan:
+//
+//   - IP-literal domain: Let's Encrypt IP certificates — "shortlived"
+//     profile, HTTP-01 only (no DNS-01 challenge exists for IP
+//     identifiers, and TLS-ALPN is not offered for them either).
+//   - DNS-01 (dnsSolver != nil): no HTTP port needed, wildcards OK.
+//   - Otherwise HTTP-01 on the configured port.
+func (m *Manager) buildACMEIssuer(dnsSolver *certmagic.DNS01Solver) certmagic.ACMEIssuer {
+	issuer := certmagic.ACMEIssuer{
+		CA:    certmagic.LetsEncryptProductionCA,
+		Email: m.cfg.Email,
+	}
+
+	httpPort := m.cfg.HTTPPort
+	if httpPort == 0 {
+		httpPort = 80
+	}
+
+	switch {
+	case isIPLiteral(m.cfg.Domain):
+		issuer.Profile = "shortlived"
+		issuer.AltHTTPPort = httpPort
+		issuer.DisableTLSALPNChallenge = true
+	case dnsSolver != nil:
+		issuer.DNS01Solver = dnsSolver
+		issuer.DisableHTTPChallenge = true
+		issuer.DisableTLSALPNChallenge = true
+	default:
+		issuer.AltHTTPPort = httpPort
+		issuer.DisableTLSALPNChallenge = true
+	}
+	return issuer
 }
 
 func validateKeyPair(certPEM, keyPEM []byte) error {

@@ -60,6 +60,41 @@ func (m *NodeMailbox) SeedBaseline(users []model.UserSpec, config *model.NodeSpe
 	}
 }
 
+// SyncBaseline replaces the stored full-state baseline with a set the
+// service has just applied from an authoritative REST snapshot
+// (NODE-011). SeedBaseline only ever ran at startup, so after a REST
+// reconciliation removed a user, the mailbox kept merging later WS
+// deltas into the stale baseline and the drained full set wrote the
+// removed user's authorization back into the kernel.
+//
+// If a WS-driven update is still waiting to drain it may be newer
+// than the snapshot: the baseline is then left untouched and a
+// reconcile is requested, so the drain is followed by a fresh REST
+// snapshot that re-orders the two sources by panel state.
+func (m *NodeMailbox) SyncBaseline(users []model.UserSpec, config *model.NodeSpec) {
+	m.mu.Lock()
+	changed := false
+	if users != nil {
+		if m.dirtyUsers {
+			if !m.needsReconcile {
+				m.needsReconcile = true
+				changed = true
+			}
+		} else {
+			m.users = cloneUsers(users)
+			m.hasFullUserState = true
+		}
+	}
+	if config != nil && !m.dirtyConfig {
+		m.config = cloneNodeSpec(config)
+	}
+	m.mu.Unlock()
+
+	if changed {
+		m.notify()
+	}
+}
+
 func (m *NodeMailbox) Apply(event Event) {
 	m.mu.Lock()
 	changed := false

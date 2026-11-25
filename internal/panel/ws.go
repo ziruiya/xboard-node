@@ -388,14 +388,30 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 
 	case WSEventSyncUsers:
 		nlog.Core().Debug("ws sync users event received")
+		// NODE-010: an explicit "users": [] is a valid full snapshot —
+		// it means nobody is authorized any more and the local set
+		// must be cleared. Only a MISSING (or null) users field is a
+		// malformed payload. The old len==0 check dropped the empty
+		// snapshot, so while WS stayed connected (suppressing REST
+		// reconciliation) previously loaded credentials kept working
+		// indefinitely.
+		var probe map[string]json.RawMessage
+		if err := json.Unmarshal(msg.Data, &probe); err != nil {
+			nlog.Core().Warn("ws: cannot decode users payload", "error", err)
+			return
+		}
+		rawUsers, present := probe["users"]
+		if !present || string(rawUsers) == "null" {
+			nlog.Core().Warn("ws: users payload missing users field")
+			return
+		}
 		var p syncUsersPayload
 		if err := decodeData(msg.Data, &p); err != nil {
 			nlog.Core().Warn("ws: cannot decode users payload", "error", err)
 			return
 		}
-		if len(p.Users) == 0 {
-			nlog.Core().Warn("ws: users payload empty")
-			return
+		if p.Users == nil {
+			p.Users = []User{}
 		}
 		event.Users = p.Users
 		event.NodeID = p.NodeID

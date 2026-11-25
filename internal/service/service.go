@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -153,7 +154,7 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 	l := limiter.New()
 	st := limiter.NewSpeedTracker(l)
 
-	return &Service{
+	s := &Service{
 		cfg:          cfg,
 		source:       cp,
 		sink:         cp,
@@ -166,6 +167,20 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 		wsStatusCh:   make(chan controlplane.StatusChange, 4),
 		pullResults:  make(chan pullResult, 1),
 	}
+
+	// SB-TA-010: persist the unacknowledged traffic batch so a
+	// restart resends it with its original ID instead of losing the
+	// last window. Machine-mode config dirs are already per-node;
+	// standalone multi-node layouts can share one dir, so the file
+	// name carries the node ID when known.
+	if dir := cfg.Kernel.ConfigDir; dir != "" {
+		name := "traffic-batch.json"
+		if cfg.Panel.NodeID > 0 {
+			name = fmt.Sprintf("traffic-batch-%d.json", cfg.Panel.NodeID)
+		}
+		s.tracker.EnablePersistence(filepath.Join(dir, name))
+	}
+	return s
 }
 
 func (s *Service) Run(ctx context.Context) error {
@@ -682,6 +697,26 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 		}
 	}
 
+	// NODE-011: a REST snapshot is authoritative for the mailbox
+	// baseline too. Without this, the mailbox kept merging WS deltas
+	// into its startup baseline and a later drain wrote users back
+	// that this snapshot had just removed.
+	if s.machineMailbox != nil && (result.users != nil || result.config != nil) {
+		s.metricsMu.RLock()
+		appliedUsers := s.lastUsers
+		appliedConfig := s.lastConfig
+		s.metricsMu.RUnlock()
+		var syncUsers []model.UserSpec
+		if result.users != nil {
+			syncUsers = appliedUsers
+		}
+		var syncConfig *model.NodeSpec
+		if result.config != nil {
+			syncConfig = appliedConfig
+		}
+		s.machineMailbox.SyncBaseline(syncUsers, syncConfig)
+	}
+
 	if configChanged {
 		s.applyChanges(ctx, true, false)
 	}
@@ -751,16 +786,26 @@ func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
 	return true
 }
 
-// ensureRunning starts the kernel if it is not running and there are users +
-// config available. Returns true if the kernel is running afterwards.
-func (s *Service) ensureRunning() bool {
+// startWithCandidateUsers starts a stopped kernel directly with a
+// candidate user set (NODE-012). The decision is made against the
+// CANDIDATE set, never against the previously applied one: the old
+// ensureRunning() helper judged by the stale set, so a node that had
+// started with zero users discarded every later user-only update and
+// could never pick up its first user. On start failure the previous
+// state is restored and false is returned.
+func (s *Service) startWithCandidateUsers(users []model.UserSpec) bool {
 	if s.kernel.IsRunning() {
 		return true
 	}
-	if len(s.lastUsers) > 0 && s.lastConfig != nil {
-		return s.startKernel(s.lastConfig, s.lastUsers)
+	if s.lastConfig == nil || len(users) == 0 {
+		return false
 	}
-	return false
+	prevUsers, prevHash := s.prepareUserState(users)
+	if !s.startKernel(s.lastConfig, users) {
+		s.restoreUserState(prevUsers, prevHash)
+		return false
+	}
+	return true
 }
 
 // ─── User update entry points ───────────────────────────────────────────────
@@ -768,7 +813,21 @@ func (s *Service) ensureRunning() bool {
 // applyUserUpdate replaces the full user set and hot-swaps the kernel.
 // Called from WS sync.users and REST polling.
 func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, newHash string) {
-	if !s.ensureRunning() {
+	if !s.kernel.IsRunning() {
+		// NODE-012: judge by the candidate set. With a stopped kernel
+		// and a non-empty candidate set + config, start the kernel
+		// with the new set directly; with nothing startable, still
+		// record the authoritative set so state and hashes stay
+		// truthful for the next update.
+		if s.startWithCandidateUsers(users) {
+			if newHash != "" {
+				s.lastUserHash = newHash
+			}
+			return
+		}
+		if s.lastConfig == nil || len(users) == 0 {
+			s.updateUserState(users)
+		}
 		return
 	}
 
@@ -800,7 +859,12 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 		}
 		merged := mergeUsers(s.lastUsers, deltaUsers)
 
-		if !s.ensureRunning() {
+		if !s.kernel.IsRunning() {
+			// NODE-012: same candidate-set rule as applyUserUpdate —
+			// a first user arriving as a delta on a node that started
+			// empty must start the kernel with the merged set, not be
+			// discarded for the stale set being empty.
+			s.startWithCandidateUsers(merged)
 			return
 		}
 

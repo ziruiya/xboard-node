@@ -76,11 +76,22 @@ type RelayTrafficBatch struct {
 	Connections int64  `json:"connections"`
 }
 
+// RelayRejectedBatch names one batch the panel permanently refused
+// (SB-ER-014, panel half): the agent drops exactly these batches from
+// its pending queue and keeps everything else for resend.
+type RelayRejectedBatch struct {
+	RuleCode string `json:"rule_code"`
+	BootID   string `json:"boot_id"`
+	Seq      int64  `json:"seq"`
+	Reason   string `json:"reason"` // unknown_rule | invalid_batch
+}
+
 // RelayTrafficResult mirrors RelayTrafficService::ingest's return.
 type RelayTrafficResult struct {
-	Accepted   int `json:"accepted"`
-	Duplicates int `json:"duplicates"`
-	Rejected   int `json:"rejected"`
+	Accepted        int                  `json:"accepted"`
+	Duplicates      int                  `json:"duplicates"`
+	Rejected        int                  `json:"rejected"`
+	RejectedBatches []RelayRejectedBatch `json:"rejected_batches"`
 }
 
 // FetchRelayConfig pulls the machine's current published relay config.

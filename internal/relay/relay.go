@@ -189,6 +189,7 @@ type Manager struct {
 	bootID    string
 
 	mu             sync.Mutex
+	flushMu        sync.Mutex // NODE-003: serializes flushTraffic end to end
 	gostInitOnce   sync.Once
 	genCounter     atomic.Int64 // R04: per-start generation, suffixes gost component names
 	state          *diskState
@@ -373,10 +374,12 @@ func (m *Manager) ackLocked(version int, hash string, applied bool, errText stri
 // left the rules it had already switched running their NEW specs: a
 // mixed ruleset that is neither the old document nor the new one. The
 // apply below treats the document as one atomic unit:
-//   A. every fresh rule and every disjoint swap is STAGED — built,
-//      started and serve-verified WITHOUT registering it and without
-//      closing anything it will replace; any failure tears down all
-//      staged runtimes and the confirmed ruleset is untouched;
+//   A. every fresh rule and every disjoint swap is STAGED — built
+//      (sockets bound, bind conflicts proven out) but NOT serving and
+//      NOT registered, without closing anything it will replace; any
+//      failure tears down all staged runtimes and the confirmed
+//      ruleset is untouched (NODE-007: staged runtimes forward
+//      nothing; serving starts only at the commit point below);
 //   B. overlapping swaps (which cannot be staged — the new runtime
 //      cannot bind until the old one closes) run one by one, each
 //      individually restored on failure as in R04; if one fails, the
@@ -459,7 +462,7 @@ func (m *Manager) apply(ctx context.Context, doc *panel.RelayDocument) error {
 		}
 	}
 	for _, spec := range fresh {
-		rt, err := m.startRuntimeLocked(spec)
+		rt, err := m.buildRuntimeLocked(spec)
 		if err != nil {
 			teardownStaged()
 			m.mu.Unlock()
@@ -472,8 +475,9 @@ func (m *Manager) apply(ctx context.Context, doc *panel.RelayDocument) error {
 			continue // stage B: cannot be staged, the sockets collide
 		}
 		// Make-before-break: the new runtime binds disjoint sockets, so
-		// it can prove itself while the old one keeps serving.
-		rt, err := m.startRuntimeLocked(sw.spec)
+		// it can prove its sockets while the old one keeps serving. It
+		// does not forward yet (NODE-007) — serving starts at commit.
+		rt, err := m.buildRuntimeLocked(sw.spec)
 		if err != nil {
 			teardownStaged()
 			m.mu.Unlock()
@@ -525,9 +529,34 @@ func (m *Manager) apply(ctx context.Context, doc *panel.RelayDocument) error {
 		doneOverlap = append(doneOverlap, sw)
 	}
 
-	// Commit (B02): everything new is proven. Register the staged
-	// runtimes, close the disjoint-swap predecessors they replace, and
-	// close the removals last.
+	// Commit (B02 + NODE-007): the staged runtimes start serving only
+	// now — until this point they held their sockets bound but
+	// forwarded nothing, so no uncommitted ruleset was ever exposed to
+	// traffic. If a staged runtime fails its serve check here, all
+	// staged runtimes are torn down and the stage-B swaps are
+	// reversed: the machine keeps exactly the last confirmed ruleset.
+	serveStaged := func() error {
+		for _, rt := range stagedFresh {
+			if err := m.serveRuntimeLocked(rt); err != nil {
+				return err
+			}
+		}
+		for _, s := range stagedDisjoint {
+			if err := m.serveRuntimeLocked(s.rt); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := serveStaged(); err != nil {
+		teardownStaged()
+		reverseOverlap()
+		m.mu.Unlock()
+		return err
+	}
+
+	// Register the staged runtimes, close the disjoint-swap
+	// predecessors they replace, and close the removals last.
 	for _, rt := range stagedFresh {
 		m.running[rt.spec.RuleCode] = rt
 	}
@@ -678,28 +707,36 @@ func (m *Manager) ensureGostInit() {
 	})
 }
 
-// startRuntimeLocked builds and starts one rule's gost services
-// through the config parser and verifies they actually serve, WITHOUT
-// registering the runtime in m.running — the caller decides when (and
-// whether) the verified runtime joins the serving set. Services are
-// held directly by the manager and never registered in the global
-// service registry: loader.Load's group replacement closes every
-// previously registered service, which would kill unrelated rules on
-// any change (found in the HK2 pilot, 2026-11-25).
+// buildRuntimeLocked builds one rule's gost services through the
+// config parser WITHOUT serving them and WITHOUT registering the
+// runtime in m.running — the caller decides when (and whether) the
+// runtime joins the serving set. Services are held directly by the
+// manager and never registered in the global service registry:
+// loader.Load's group replacement closes every previously registered
+// service, which would kill unrelated rules on any change (found in
+// the HK2 pilot, 2026-11-25).
 //
-// R04: on ANY failure the half-started runtime is torn down completely
+// gost binds its sockets at parse time, so a built runtime already
+// proves its listen sockets are free — but it forwards nothing until
+// serveRuntimeLocked runs its accept loops. NODE-007: apply() stages
+// new runtimes in this built-but-silent state and only serves them at
+// the commit point, so an apply that later fails never exposed an
+// uncommitted ruleset to traffic.
+//
+// R04: on ANY failure the half-built runtime is torn down completely
 // (services closed, components unregistered) before the error returns.
-// B02: registration used to happen here, before the serve check — an
-// unverified runtime sat in m.running where later syncs could mistake
-// it for a live one, and apply() could not stage several new runtimes
-// without committing each one as it went. Caller holds m.mu.
-func (m *Manager) startRuntimeLocked(spec panel.RelayRule) (*ruleRuntime, error) {
+// Caller holds m.mu.
+func (m *Manager) buildRuntimeLocked(spec panel.RelayRule) (*ruleRuntime, error) {
 	m.ensureGostInit()
 	gen := m.genCounter.Add(1)
-	rt, err := m.buildRule(spec, gen)
-	if err != nil {
-		return nil, err
-	}
+	return m.buildRule(spec, gen)
+}
+
+// serveRuntimeLocked starts a built runtime's services and verifies
+// they actually serve, surfacing immediate failures (bind races etc.)
+// to the caller. On failure the runtime is torn down completely.
+// Caller holds m.mu.
+func (m *Manager) serveRuntimeLocked(rt *ruleRuntime) error {
 	for _, ref := range rt.services {
 		go m.serveRule(rt, ref)
 	}
@@ -708,8 +745,23 @@ func (m *Manager) startRuntimeLocked(spec panel.RelayRule) (*ruleRuntime, error)
 	for _, ref := range rt.services {
 		if v := ref.err.Load(); v != nil {
 			m.closeRuntimeLocked(rt)
-			return nil, fmt.Errorf("rule %s service %s: %s", spec.RuleCode, ref.name, v.(string))
+			return fmt.Errorf("rule %s service %s: %s", rt.spec.RuleCode, ref.name, v.(string))
 		}
+	}
+	return nil
+}
+
+// startRuntimeLocked builds and immediately serves one rule's runtime
+// (stage-B overlapping swaps and restores, where the predecessor is
+// already closed and delay would only extend the outage). Caller
+// holds m.mu.
+func (m *Manager) startRuntimeLocked(spec panel.RelayRule) (*ruleRuntime, error) {
+	rt, err := m.buildRuntimeLocked(spec)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.serveRuntimeLocked(rt); err != nil {
+		return nil, err
 	}
 	return rt, nil
 }
@@ -800,11 +852,21 @@ func (m *Manager) buildRule(spec panel.RelayRule, gen int64) (rt *ruleRuntime, e
 				"ttl": (time.Duration(spec.UDPIdleTimeoutSec) * time.Second).String(),
 			}
 		}
-		if spec.MaxConnections > 0 {
+		// NODE-005: the panel publishes an independent UDP session
+		// cap (udp_max_sessions). gost enforces a service's conn
+		// limiter on its listener Accept path — for UDP that is
+		// exactly session creation/teardown — so the UDP service
+		// gets its own limiter with the UDP cap instead of silently
+		// inheriting (or ignoring) the TCP connection cap.
+		connLimit := spec.MaxConnections
+		if tr == "udp" && spec.UDPMaxSessions > 0 {
+			connLimit = spec.UDPMaxSessions
+		}
+		if connLimit > 0 {
 			climName := name + "-clim"
 			lim := limiter_parser.ParseConnLimiter(&xconfig.LimiterConfig{
 				Name:   climName,
-				Limits: []string{"$ " + strconv.Itoa(spec.MaxConnections)},
+				Limits: []string{"$ " + strconv.Itoa(connLimit)},
 			})
 			if err = registry.ConnLimiterRegistry().Register(climName, lim); err != nil {
 				return nil, fmt.Errorf("register conn limiter %s: %w", climName, err)
@@ -931,7 +993,17 @@ func (m *Manager) ruleTotalsLocked(code string) counters {
 // flushTraffic folds idle zombies, turns counter deltas into durable
 // batches, and sends the pending queue. Batches are persisted before
 // sending; a failed send leaves them queued with their original ids.
+//
+// NODE-003: the whole flush is serialized on flushMu. The ticker flush
+// and the shutdown flush used to interleave — the network send happens
+// outside m.mu, and the older flush's unconditional queue clear could
+// delete batches a younger flush had just enqueued (and not yet sent
+// successfully). Settlement now removes exactly the batches the panel
+// accounted for, by identity, never the whole queue by position.
 func (m *Manager) flushTraffic() {
+	m.flushMu.Lock()
+	defer m.flushMu.Unlock()
+
 	m.mu.Lock()
 	// Fold zombies whose connections have fully drained.
 	for code, list := range m.zombies {
@@ -961,6 +1033,18 @@ func (m *Manager) flushTraffic() {
 		total := m.ruleTotalsLocked(code)
 		delta := total.sub(m.state.Reported[code])
 		if delta.zero() {
+			continue
+		}
+		if delta.In < 0 || delta.Out < 0 || delta.Conns < 0 {
+			// NODE-001 (defense in depth): a negative batch is
+			// unbookable — the panel rejects it and it would poison
+			// the queue for every later batch. The startup rebase in
+			// loadState makes this unreachable in normal operation;
+			// if a counter ever does move backwards mid-process,
+			// rebase the watermark instead of emitting poison.
+			nlog.Core().Error("relay traffic delta went negative, rebasing watermark",
+				"rule", code, "delta_in", delta.In, "delta_out", delta.Out, "delta_conns", delta.Conns)
+			m.state.Reported[code] = total
 			continue
 		}
 		seq := m.state.NextSeq[code]
@@ -999,24 +1083,74 @@ func (m *Manager) flushTraffic() {
 			nlog.Core().Warn("relay traffic report failed, batches stay queued", "count", len(pending), "error", err)
 			return
 		}
-		if res.Rejected > 0 {
-			// A batch the panel will never take (e.g. its rule was
-			// deleted) must not poison the queue forever. The bytes
-			// stay counted in Reported, so this is a stats loss on a
-			// deleted rule only — logged loudly.
-			nlog.Core().Error("relay traffic batches rejected by panel, dropping queue",
-				"accepted", res.Accepted, "duplicates", res.Duplicates, "rejected", res.Rejected)
-			m.mu.Lock()
-			m.state.Pending = nil
-			m.saveStateLocked()
-			m.mu.Unlock()
+		if !m.settleChunk(pending[start:end], res) {
 			return
 		}
 	}
+}
+
+// batchKey identifies one immutable traffic batch.
+type batchKey struct {
+	rule string
+	boot string
+	seq  int64
+}
+
+func keyOf(b panel.RelayTrafficBatch) batchKey {
+	return batchKey{rule: b.RuleCode, boot: b.BootID, seq: b.Seq}
+}
+
+// settleChunk removes exactly the batches of one sent chunk that the
+// panel has accounted for (SB-ER-014 / NODE-002): accepted and
+// duplicate batches are booked, batches named in rejected_batches are
+// permanently refused (e.g. their rule was deleted) and dropped loudly
+// — their bytes stay counted in Reported, so this is a stats loss on
+// dead rules only. Every other batch stays queued with its original
+// id, including batches in later chunks that were never sent.
+//
+// The old behaviour — any rejection cleared the ENTIRE pending queue —
+// permanently lost valid data whenever one stale batch sat anywhere
+// in a multi-chunk backlog.
+//
+// Returns false when the panel's verdict cannot be reconciled with
+// the chunk (counts disagree, or rejections without per-batch names
+// from a pre-ER-014 panel): the chunk then stays fully queued and the
+// flush stops, rather than guessing which batches died.
+func (m *Manager) settleChunk(chunk []panel.RelayTrafficBatch, res *panel.RelayTrafficResult) bool {
+	if res.Accepted+res.Duplicates+res.Rejected != len(chunk) {
+		nlog.Core().Error("relay traffic verdict does not add up, keeping chunk queued",
+			"chunk", len(chunk), "accepted", res.Accepted, "duplicates", res.Duplicates, "rejected", res.Rejected)
+		return false
+	}
+	if res.Rejected > 0 && len(res.RejectedBatches) != res.Rejected {
+		nlog.Core().Error("relay traffic rejections without per-batch verdicts, keeping chunk queued",
+			"chunk", len(chunk), "rejected", res.Rejected, "named", len(res.RejectedBatches))
+		return false
+	}
+
+	settled := make(map[batchKey]bool, len(chunk))
+	for _, b := range chunk {
+		settled[keyOf(b)] = true
+	}
+	for _, rb := range res.RejectedBatches {
+		nlog.Core().Error("relay traffic batch permanently rejected by panel, dropping it",
+			"rule", rb.RuleCode, "boot_id", rb.BootID, "seq", rb.Seq, "reason", rb.Reason)
+	}
+
 	m.mu.Lock()
-	m.state.Pending = nil
+	kept := m.state.Pending[:0]
+	for _, b := range m.state.Pending {
+		if settled[keyOf(b)] {
+			continue
+		}
+		kept = append(kept, b)
+	}
+	// Only this chunk's identities are in the settled set, so batches
+	// from later chunks (not yet sent) survive untouched.
+	m.state.Pending = kept
 	m.saveStateLocked()
 	m.mu.Unlock()
+	return true
 }
 
 // ─── Durable state ───────────────────────────────────────────────────
@@ -1044,6 +1178,44 @@ func (m *Manager) loadState() {
 	}
 	if s.Reported == nil {
 		s.Reported = make(map[string]counters)
+	}
+
+	// NODE-001: Reported is a watermark over counter totals that
+	// included the PREVIOUS process's live services. Those counters
+	// died with that process; this process's services start from
+	// zero, so total − Reported could go negative — and the panel
+	// rejects negative batches, which used to poison the queue for
+	// every later batch. Rebase the watermark onto the durable
+	// Banked totals (the only totals that survive a restart).
+	// Pending batches carry their own bytes and are resent verbatim,
+	// so nothing already batched is counted twice, and new deltas
+	// measure only this process's counters.
+	for code, banked := range s.Banked {
+		s.Reported[code] = banked
+	}
+	for code := range s.Reported {
+		if _, ok := s.Banked[code]; !ok {
+			s.Reported[code] = counters{}
+		}
+	}
+	// Recovery path for queues already poisoned on disk: a negative
+	// batch can never be booked, so drop it (loudly) instead of
+	// letting it block the queue forever.
+	if len(s.Pending) > 0 {
+		kept := s.Pending[:0]
+		dropped := 0
+		for _, b := range s.Pending {
+			if b.BytesIn < 0 || b.BytesOut < 0 || b.Connections < 0 {
+				dropped++
+				continue
+			}
+			kept = append(kept, b)
+		}
+		if dropped > 0 {
+			nlog.Core().Error("relay state: dropped unbookable negative traffic batches from a previous run",
+				"count", dropped)
+			s.Pending = kept
+		}
 	}
 	m.state = &s
 }

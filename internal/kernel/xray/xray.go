@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -298,9 +299,15 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 		userMap[u.ID] = u
 	}
 	var toAdd []model.UserSpec
+	var rotated []model.UserSpec
 	for _, u := range users {
-		if _, exists := userMap[u.ID]; !exists {
+		if old, exists := userMap[u.ID]; !exists {
 			toAdd = append(toAdd, u)
+		} else if old.UUID != u.UUID {
+			// NODE-013: a credential rotation must revoke the old
+			// identity before adding the new one — both share the
+			// same ID-derived email, so a bare AddUser collides.
+			rotated = append(rotated, u)
 		}
 		userMap[u.ID] = u // always overwrite properties
 	}
@@ -309,7 +316,7 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 		merged = append(merged, u)
 	}
 
-	if len(toAdd) == 0 {
+	if len(toAdd) == 0 && len(rotated) == 0 {
 		// No new kernel users, but properties (limits) may have changed.
 		x.users = merged
 		x.mu.Unlock()
@@ -327,7 +334,7 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 		if err := x.Start(nc, merged, t); err != nil {
 			return 0, err
 		}
-		return len(toAdd), nil
+		return len(toAdd) + len(rotated), nil
 	}
 
 	proto := x.protocol
@@ -335,6 +342,14 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 	x.mu.Unlock()
 
 	ctx := context.Background()
+	// NODE-013: revoke rotated users' old identities first (same
+	// ID-derived email), then add them back with the new credential.
+	for _, u := range rotated {
+		if err := um.RemoveUser(ctx, userEmail(u.ID)); err != nil {
+			nlog.Core().Warn("xray: RemoveUser (rotation) failed", "user", u.ID, "error", err)
+		}
+	}
+	toAdd = append(toAdd, rotated...)
 	added := 0
 	for _, u := range toAdd {
 		mu, err := toMemoryUser(proto, nc, u)
@@ -463,24 +478,14 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 	nc := x.nodeConfig
 	x.mu.Unlock()
 
-	ctx := context.Background()
-
-	// Remove first, then add (order matters for UUID changes on same ID)
-	for _, u := range toRemove {
-		email := userEmail(u.ID)
-		if err := um.RemoveUser(ctx, email); err != nil {
-			nlog.Core().Debug("xray: RemoveUser skipped in UpdateUsers", "user", u.ID, "error", err)
-		}
-	}
-	for _, u := range toAdd {
-		mu, err := toMemoryUser(proto, nc, u)
-		if err != nil {
-			nlog.Core().Warn("xray: skip user in UpdateUsers", "user", u.ID, "error", err)
-			continue
-		}
-		if err := um.AddUser(ctx, mu); err != nil {
-			nlog.Core().Warn("xray: AddUser failed in UpdateUsers", "user", u.ID, "error", err)
-		}
+	if err := applyUserSyncUM(context.Background(), um, proto, nc, toAdd, toRemove); err != nil {
+		// NODE-013: do NOT advance the in-memory snapshot when the
+		// running kernel's credential set was not actually driven to
+		// the target state — the snapshot would claim the new set
+		// while the old credentials keep authenticating. Returning an
+		// error makes the caller fall back to a full kernel restart
+		// with the new set, which converges both.
+		return 0, 0, fmt.Errorf("xray: user sync incomplete: %w", err)
 	}
 
 	x.mu.Lock()
@@ -494,6 +499,40 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 }
 
 var _ kernel.Kernel = (*Xray)(nil)
+
+// applyUserSyncUM drives a UserManager to the target credential set:
+// removals first, then additions (order matters for UUID changes on
+// the same ID — UserDiff lists a rotated user in both sets, and the
+// old credential, filed under the same ID-derived email, must be gone
+// before the new one can be added, NODE-013). Any failure is returned
+// so the caller can refuse to advance its snapshot and fall back to a
+// full restart instead of silently keeping stale credentials valid.
+func applyUserSyncUM(ctx context.Context, um xrayProxy.UserManager, proto string, nc *model.NodeSpec, toAdd, toRemove []model.UserSpec) error {
+	var opErrs []error
+	for _, u := range toRemove {
+		email := userEmail(u.ID)
+		if err := um.RemoveUser(ctx, email); err != nil {
+			nlog.Core().Warn("xray: RemoveUser failed in UpdateUsers", "user", u.ID, "error", err)
+			opErrs = append(opErrs, fmt.Errorf("remove user %d: %w", u.ID, err))
+		}
+	}
+	for _, u := range toAdd {
+		mu, err := toMemoryUser(proto, nc, u)
+		if err != nil {
+			nlog.Core().Warn("xray: skip user in UpdateUsers", "user", u.ID, "error", err)
+			opErrs = append(opErrs, fmt.Errorf("build user %d: %w", u.ID, err))
+			continue
+		}
+		if err := um.AddUser(ctx, mu); err != nil {
+			nlog.Core().Warn("xray: AddUser failed in UpdateUsers", "user", u.ID, "error", err)
+			opErrs = append(opErrs, fmt.Errorf("add user %d: %w", u.ID, err))
+		}
+	}
+	if len(opErrs) > 0 {
+		return errors.Join(opErrs...)
+	}
+	return nil
+}
 
 // ─── Internal helpers ───────────────────────────────────────────────────────
 
