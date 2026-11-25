@@ -216,6 +216,74 @@ func udpRoundTrip(t *testing.T, addr, msg string) string {
 	return string(buf[:n])
 }
 
+// Regression test for the HK2 pilot finding (2026-11-25): building a
+// second rule must not close or disturb the first rule's services.
+// (loader.Load's registry group replacement closes every registered
+// service; the manager now parses services per rule instead.)
+func TestAddRuleDoesNotDisturbExisting(t *testing.T) {
+	echoPort := freePort(t)
+	startEcho(t, echoPort, "E:")
+	portA := freePort(t)
+	portB := freePort(t)
+
+	mp := &mockPanel{booked: make(map[string]bool)}
+	srv := httptest.NewServer(mp.handler())
+	defer srv.Close()
+
+	client := panel.NewClient(config.PanelConfig{URL: srv.URL, Token: "tok", MachineID: 99})
+	m := NewManager(client, 99, t.TempDir(), func() map[int]bool { return map[int]bool{} })
+	m.loadState()
+	ctx := context.Background()
+
+	mkRule := func(code string, port int) panel.RelayRule {
+		return panel.RelayRule{
+			RuleCode: code, Name: code, Transport: "tcp",
+			ListenIP: "127.0.0.1", ListenPort: port,
+			TargetType: "MANUAL", TargetHost: "127.0.0.1", TargetPort: echoPort,
+			MaxConnections: 500, UDPMaxSessions: 512,
+			UDPIdleTimeoutSec: 60, DrainTimeoutSec: 5, BufferBytes: 32768,
+		}
+	}
+	ruleA := mkRule("RL000101", portA)
+	ruleB := mkRule("RL000102", portB)
+
+	mp.setDoc(1, &panel.RelayDocument{
+		Protocol: "relay.config.v1", MachineID: 99, RelayEnabled: true,
+		MachineStatus: "ENABLED", Rules: []panel.RelayRule{ruleA},
+	})
+	m.syncOnce(ctx)
+	addrA := fmt.Sprintf("127.0.0.1:%d", portA)
+	if got := tcpRoundTrip(t, addrA, "first"); got != "E:first" {
+		t.Fatalf("rule A echo = %q, want E:first", got)
+	}
+
+	// v2 adds rule B; rule A's spec is unchanged.
+	mp.setDoc(2, &panel.RelayDocument{
+		Protocol: "relay.config.v1", MachineID: 99, RelayEnabled: true,
+		MachineStatus: "ENABLED", Rules: []panel.RelayRule{ruleA, ruleB},
+	})
+	m.syncOnce(ctx)
+	ack := mp.lastAck()
+	if ack == nil || ack["applied"] != true || int(ack["version"].(float64)) != 2 {
+		t.Fatalf("v2 ack = %v, want applied v2", ack)
+	}
+	if got := tcpRoundTrip(t, addrA, "second"); got != "E:second" {
+		t.Fatalf("rule A disturbed by adding rule B: echo = %q, want E:second", got)
+	}
+	addrB := fmt.Sprintf("127.0.0.1:%d", portB)
+	if got := tcpRoundTrip(t, addrB, "bee"); got != "E:bee" {
+		t.Fatalf("rule B echo = %q, want E:bee", got)
+	}
+	// No failure ack may follow: give async serve goroutines a moment,
+	// then a same-version sync must stay clean (no suspect ack).
+	time.Sleep(400 * time.Millisecond)
+	m.syncOnce(ctx)
+	ack = mp.lastAck()
+	if ack != nil && ack["applied"] == false {
+		t.Fatalf("unexpected failure ack after adding rule B: %v", ack)
+	}
+}
+
 // ─── the end-to-end test ─────────────────────────────────────────────
 
 func TestManagerEndToEnd(t *testing.T) {

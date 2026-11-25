@@ -39,6 +39,9 @@ import (
 	coreservice "github.com/go-gost/core/service"
 	xconfig "github.com/go-gost/x/config"
 	"github.com/go-gost/x/config/loader"
+	admission_parser "github.com/go-gost/x/config/parsing/admission"
+	limiter_parser "github.com/go-gost/x/config/parsing/limiter"
+	service_parser "github.com/go-gost/x/config/parsing/service"
 	"github.com/go-gost/x/registry"
 	xservice "github.com/go-gost/x/service"
 
@@ -104,12 +107,22 @@ type svcRef struct {
 	done atomic.Bool
 }
 
+// componentRef is a named gost component (limiter / admission) that a
+// rule registered in the global registries at build time. They are
+// registered individually — never through loader.Load, whose group
+// replacement would close every other rule's components and services.
+type componentRef struct {
+	kind string // tlim | clim | adm
+	name string
+}
+
 // ruleRuntime is one applied rule: one gost service per transport.
 type ruleRuntime struct {
-	spec     panel.RelayRule
-	services []*svcRef
-	closed   atomic.Bool
-	restarts []time.Time // recent restart timestamps (crash backoff)
+	spec       panel.RelayRule
+	services   []*svcRef
+	components []componentRef
+	closed     atomic.Bool
+	restarts   []time.Time // recent restart timestamps (crash backoff)
 }
 
 func (rt *ruleRuntime) healthy() bool {
@@ -177,6 +190,7 @@ type Manager struct {
 	bootID    string
 
 	mu             sync.Mutex
+	gostInitOnce   sync.Once
 	state          *diskState
 	running        map[string]*ruleRuntime
 	zombies        map[string][]*ruleRuntime // closed services still draining; folded once idle
@@ -213,6 +227,7 @@ func NewManager(client *panel.Client, machineID int, stateDir string, ownNodes f
 // Run blocks until ctx is cancelled: config sync loop + traffic loop.
 func (m *Manager) Run(ctx context.Context) {
 	m.loadState()
+	m.ensureGostInit()
 	nlog.Core().Info("relay manager started", "machine_id", m.machineID, "boot_id", m.bootID, "state_dir", m.stateDir)
 
 	go m.trafficLoop(ctx)
@@ -283,12 +298,27 @@ func (m *Manager) syncOnce(ctx context.Context) {
 		return // stale document; versions are monotonic
 	}
 	if doc.Version == m.appliedVersion && hash == m.appliedHash {
-		// Already applied locally; make sure the ack landed.
-		if m.ackedVersion != doc.Version || m.ackedHash != hash {
-			m.ackLocked(doc.Version, hash, true, "")
+		// Already applied locally; make sure the ack landed, and that
+		// every desired rule is still actually alive — a service that
+		// died after its ack must be restarted within one poll cycle.
+		healthy := true
+		if doc.RelayEnabled && doc.MachineStatus != "DRAINING" {
+			for _, r := range doc.Rules {
+				rt, ok := m.running[r.RuleCode]
+				if !ok || !rt.healthy() {
+					healthy = false
+					break
+				}
+			}
 		}
-		m.mu.Unlock()
-		return
+		if healthy {
+			if m.ackedVersion != doc.Version || m.ackedHash != hash {
+				m.ackLocked(doc.Version, hash, true, "")
+			}
+			m.mu.Unlock()
+			return
+		}
+		nlog.Core().Warn("relay rule unhealthy at applied version, re-applying", "version", doc.Version)
 	}
 	m.mu.Unlock()
 
@@ -411,8 +441,8 @@ func (m *Manager) waitDrain(ctx context.Context, stopped []*ruleRuntime) {
 
 // closeRuntimeLocked closes a rule's services (listeners stop accepting
 // immediately; established flows finish on their own and keep counting
-// into the zombie entry until idle, when the traffic fold banks them).
-// Caller holds m.mu.
+// into the zombie entry until idle, when the traffic fold banks them)
+// and unregisters its gost components. Caller holds m.mu.
 func (m *Manager) closeRuntimeLocked(rt *ruleRuntime) {
 	if rt.closed.Load() {
 		return
@@ -423,12 +453,44 @@ func (m *Manager) closeRuntimeLocked(rt *ruleRuntime) {
 			nlog.Core().Warn("relay service close failed", "service", ref.name, "error", err)
 		}
 	}
+	unregisterComponents(rt)
 	m.zombies[rt.spec.RuleCode] = append(m.zombies[rt.spec.RuleCode], rt)
 }
 
-// startRulesLocked builds and starts gost services for the given rules.
-// Caller holds m.mu.
+func unregisterComponents(rt *ruleRuntime) {
+	for _, c := range rt.components {
+		switch c.kind {
+		case "tlim":
+			registry.TrafficLimiterRegistry().Unregister(c.name)
+		case "clim":
+			registry.ConnLimiterRegistry().Unregister(c.name)
+		case "adm":
+			registry.AdmissionRegistry().Unregister(c.name)
+		}
+	}
+	rt.components = nil
+}
+
+// ensureGostInit performs the one-time gost runtime initialization
+// (default logger + TLS config). This is the ONLY loader.Load call in
+// the process: its group-replacement semantics close everything
+// previously registered, so per-rule work uses the parser directly.
+func (m *Manager) ensureGostInit() {
+	m.gostInitOnce.Do(func() {
+		if err := loader.Load(&xconfig.Config{Log: &xconfig.LogConfig{Level: "error"}}); err != nil {
+			nlog.Core().Warn("relay gost init failed", "error", err)
+		}
+	})
+}
+
+// startRulesLocked builds and starts gost services for the given rules,
+// one rule at a time through the config parser. Services are held
+// directly by the manager and never registered in the global service
+// registry: loader.Load's group replacement closes every previously
+// registered service, which would kill unrelated rules on any change
+// (found in the HK2 pilot, 2026-11-25). Caller holds m.mu.
 func (m *Manager) startRulesLocked(specs []panel.RelayRule) error {
+	m.ensureGostInit()
 	if ratio, err := fdUsage(); err == nil {
 		if ratio >= fdStopRatio {
 			return fmt.Errorf("fd usage %.0f%% >= %.0f%% stop line, refusing new relay services", ratio*100, fdStopRatio*100)
@@ -438,36 +500,21 @@ func (m *Manager) startRulesLocked(specs []panel.RelayRule) error {
 		}
 	}
 
-	cfg := &xconfig.Config{Log: &xconfig.LogConfig{Level: "error"}}
-	runtimes := make([]*ruleRuntime, 0, len(specs))
+	var started []*ruleRuntime
 	for _, spec := range specs {
-		rt := &ruleRuntime{spec: spec}
-		svcs, err := m.buildRuleServices(cfg, spec)
+		rt, err := m.buildRule(spec)
 		if err != nil {
 			return err
 		}
-		rt.services = svcs
-		runtimes = append(runtimes, rt)
-	}
-	if err := loader.Load(cfg); err != nil {
-		return fmt.Errorf("gost load: %w", err)
-	}
-	for _, rt := range runtimes {
-		for _, ref := range rt.services {
-			svc := registry.ServiceRegistry().Get(ref.name)
-			if svc == nil {
-				return fmt.Errorf("relay service %s missing after load", ref.name)
-			}
-			ref.svc = svc
-		}
-		m.running[rt.spec.RuleCode] = rt
+		m.running[spec.RuleCode] = rt
+		started = append(started, rt)
 		for _, ref := range rt.services {
 			go m.serveRule(rt, ref)
 		}
 	}
 	// Surface immediate serve failures (bind races etc.) to the ack.
 	time.Sleep(250 * time.Millisecond)
-	for _, rt := range runtimes {
+	for _, rt := range started {
 		for _, ref := range rt.services {
 			if v := ref.err.Load(); v != nil {
 				return fmt.Errorf("rule %s service %s: %s", rt.spec.RuleCode, ref.name, v.(string))
@@ -475,6 +522,106 @@ func (m *Manager) startRulesLocked(specs []panel.RelayRule) error {
 		}
 	}
 	return nil
+}
+
+// buildRule parses one rule's gost services and registers its named
+// components. On error everything it created is torn down again.
+func (m *Manager) buildRule(spec panel.RelayRule) (rt *ruleRuntime, err error) {
+	rt = &ruleRuntime{spec: spec}
+	defer func() {
+		if err != nil {
+			for _, ref := range rt.services {
+				_ = ref.svc.Close()
+			}
+			unregisterComponents(rt)
+		}
+	}()
+
+	host, port := m.effectiveTarget(spec)
+	targetAddr := net.JoinHostPort(host, strconv.Itoa(port))
+
+	var transports []string
+	switch strings.ToLower(spec.Transport) {
+	case "tcp":
+		transports = []string{"tcp"}
+	case "udp":
+		transports = []string{"udp"}
+	default:
+		transports = []string{"tcp", "udp"}
+	}
+
+	for _, tr := range transports {
+		name := "relay-" + strings.ToLower(spec.RuleCode) + "-" + tr
+		svcCfg := &xconfig.ServiceConfig{
+			Name:     name,
+			Addr:     net.JoinHostPort(spec.ListenIP, strconv.Itoa(spec.ListenPort)),
+			Handler:  &xconfig.HandlerConfig{Type: tr},
+			Listener: &xconfig.ListenerConfig{Type: tr},
+			Forwarder: &xconfig.ForwarderConfig{
+				Nodes: []*xconfig.ForwardNodeConfig{{Name: "target-0", Addr: targetAddr}},
+			},
+			Metadata: map[string]any{"enableStats": true},
+		}
+		if tr == "udp" && spec.UDPIdleTimeoutSec > 0 {
+			svcCfg.Listener.Metadata = map[string]any{
+				"ttl": (time.Duration(spec.UDPIdleTimeoutSec) * time.Second).String(),
+			}
+		}
+		if spec.MaxConnections > 0 {
+			climName := name + "-clim"
+			lim := limiter_parser.ParseConnLimiter(&xconfig.LimiterConfig{
+				Name:   climName,
+				Limits: []string{"$ " + strconv.Itoa(spec.MaxConnections)},
+			})
+			if err = registry.ConnLimiterRegistry().Register(climName, lim); err != nil {
+				return nil, fmt.Errorf("register conn limiter %s: %w", climName, err)
+			}
+			rt.components = append(rt.components, componentRef{kind: "clim", name: climName})
+			svcCfg.CLimiter = climName
+		}
+		if spec.RateInBps != nil || spec.RateOutBps != nil {
+			tlimName := name + "-tlim"
+			var in, out int64
+			if spec.RateInBps != nil {
+				in = *spec.RateInBps
+			}
+			if spec.RateOutBps != nil {
+				out = *spec.RateOutBps
+			}
+			limit := "$ " + strconv.FormatInt(in, 10) + " " + strconv.FormatInt(out, 10)
+			if spec.BurstBytes != nil && *spec.BurstBytes > 0 {
+				limit += " " + strconv.FormatInt(*spec.BurstBytes, 10)
+			}
+			lim := limiter_parser.ParseTrafficLimiter(&xconfig.LimiterConfig{
+				Name:   tlimName,
+				Limits: []string{limit},
+			})
+			if err = registry.TrafficLimiterRegistry().Register(tlimName, lim); err != nil {
+				return nil, fmt.Errorf("register traffic limiter %s: %w", tlimName, err)
+			}
+			rt.components = append(rt.components, componentRef{kind: "tlim", name: tlimName})
+			svcCfg.Limiter = tlimName
+		}
+		if len(spec.AllowlistCIDRs) > 0 {
+			admName := name + "-adm"
+			adm := admission_parser.ParseAdmission(&xconfig.AdmissionConfig{
+				Name:      admName,
+				Whitelist: true,
+				Matchers:  spec.AllowlistCIDRs,
+			})
+			if err = registry.AdmissionRegistry().Register(admName, adm); err != nil {
+				return nil, fmt.Errorf("register admission %s: %w", admName, err)
+			}
+			rt.components = append(rt.components, componentRef{kind: "adm", name: admName})
+			svcCfg.Admissions = []string{admName}
+		}
+		svc, perr := service_parser.ParseService(svcCfg)
+		if perr != nil {
+			return nil, fmt.Errorf("parse service %s: %w", name, perr)
+		}
+		rt.services = append(rt.services, &svcRef{name: name, svc: svc})
+	}
+	return rt, nil
 }
 
 // serveRule runs one gost service with panic isolation: a single rule's
@@ -537,82 +684,6 @@ func (m *Manager) effectiveTarget(spec panel.RelayRule) (string, int) {
 		}
 	}
 	return host, port
-}
-
-// buildRuleServices appends the gost config fragments for one rule to
-// cfg and returns its service refs (svc fields filled after Load).
-func (m *Manager) buildRuleServices(cfg *xconfig.Config, spec panel.RelayRule) ([]*svcRef, error) {
-	host, port := m.effectiveTarget(spec)
-	targetAddr := net.JoinHostPort(host, strconv.Itoa(port))
-
-	var transports []string
-	switch strings.ToLower(spec.Transport) {
-	case "tcp":
-		transports = []string{"tcp"}
-	case "udp":
-		transports = []string{"udp"}
-	default:
-		transports = []string{"tcp", "udp"}
-	}
-
-	var refs []*svcRef
-	for _, tr := range transports {
-		name := "relay-" + strings.ToLower(spec.RuleCode) + "-" + tr
-		svc := &xconfig.ServiceConfig{
-			Name:     name,
-			Addr:     net.JoinHostPort(spec.ListenIP, strconv.Itoa(spec.ListenPort)),
-			Handler:  &xconfig.HandlerConfig{Type: tr},
-			Listener: &xconfig.ListenerConfig{Type: tr},
-			Forwarder: &xconfig.ForwarderConfig{
-				Nodes: []*xconfig.ForwardNodeConfig{{Name: "target-0", Addr: targetAddr}},
-			},
-			Metadata: map[string]any{"enableStats": true},
-		}
-		if tr == "udp" && spec.UDPIdleTimeoutSec > 0 {
-			svc.Listener.Metadata = map[string]any{
-				"ttl": (time.Duration(spec.UDPIdleTimeoutSec) * time.Second).String(),
-			}
-		}
-		if spec.MaxConnections > 0 {
-			climName := name + "-clim"
-			svc.CLimiter = climName
-			cfg.CLimiters = append(cfg.CLimiters, &xconfig.LimiterConfig{
-				Name:   climName,
-				Limits: []string{"$ " + strconv.Itoa(spec.MaxConnections)},
-			})
-		}
-		if spec.RateInBps != nil || spec.RateOutBps != nil {
-			tlimName := name + "-tlim"
-			var in, out int64
-			if spec.RateInBps != nil {
-				in = *spec.RateInBps
-			}
-			if spec.RateOutBps != nil {
-				out = *spec.RateOutBps
-			}
-			limit := "$ " + strconv.FormatInt(in, 10) + " " + strconv.FormatInt(out, 10)
-			if spec.BurstBytes != nil && *spec.BurstBytes > 0 {
-				limit += " " + strconv.FormatInt(*spec.BurstBytes, 10)
-			}
-			svc.Limiter = tlimName
-			cfg.Limiters = append(cfg.Limiters, &xconfig.LimiterConfig{
-				Name:   tlimName,
-				Limits: []string{limit},
-			})
-		}
-		if len(spec.AllowlistCIDRs) > 0 {
-			admName := name + "-adm"
-			svc.Admissions = []string{admName}
-			cfg.Admissions = append(cfg.Admissions, &xconfig.AdmissionConfig{
-				Name:      admName,
-				Whitelist: true,
-				Matchers:  spec.AllowlistCIDRs,
-			})
-		}
-		cfg.Services = append(cfg.Services, svc)
-		refs = append(refs, &svcRef{name: name})
-	}
-	return refs, nil
 }
 
 func normalizeRule(r panel.RelayRule) panel.RelayRule {
