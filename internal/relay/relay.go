@@ -673,13 +673,17 @@ func (m *Manager) restoreLocked(old *ruleRuntime) error {
 // registries reject duplicate names, so an unsuffixed rebuild could
 // never start while its predecessor lived.
 func (m *Manager) buildRule(spec panel.RelayRule, gen int64) (rt *ruleRuntime, err error) {
-	rt = &ruleRuntime{spec: spec}
+	// built is deliberately a local, not the named return: error paths
+	// return nil for rt, and the teardown below must still reach the
+	// partially built runtime (dereferencing the named return there
+	// panics and masks the real error).
+	built := &ruleRuntime{spec: spec}
 	defer func() {
 		if err != nil {
-			for _, ref := range rt.services {
+			for _, ref := range built.services {
 				_ = ref.svc.Close()
 			}
-			unregisterComponents(rt)
+			unregisterComponents(built)
 		}
 	}()
 
@@ -730,7 +734,7 @@ func (m *Manager) buildRule(spec panel.RelayRule, gen int64) (rt *ruleRuntime, e
 			if err = registry.ConnLimiterRegistry().Register(climName, lim); err != nil {
 				return nil, fmt.Errorf("register conn limiter %s: %w", climName, err)
 			}
-			rt.components = append(rt.components, componentRef{kind: "clim", name: climName})
+			built.components = append(built.components, componentRef{kind: "clim", name: climName})
 			svcCfg.CLimiter = climName
 		}
 		if spec.RateInBps != nil || spec.RateOutBps != nil {
@@ -753,7 +757,7 @@ func (m *Manager) buildRule(spec panel.RelayRule, gen int64) (rt *ruleRuntime, e
 			if err = registry.TrafficLimiterRegistry().Register(tlimName, lim); err != nil {
 				return nil, fmt.Errorf("register traffic limiter %s: %w", tlimName, err)
 			}
-			rt.components = append(rt.components, componentRef{kind: "tlim", name: tlimName})
+			built.components = append(built.components, componentRef{kind: "tlim", name: tlimName})
 			svcCfg.Limiter = tlimName
 		}
 		if len(spec.AllowlistCIDRs) > 0 {
@@ -766,16 +770,16 @@ func (m *Manager) buildRule(spec panel.RelayRule, gen int64) (rt *ruleRuntime, e
 			if err = registry.AdmissionRegistry().Register(admName, adm); err != nil {
 				return nil, fmt.Errorf("register admission %s: %w", admName, err)
 			}
-			rt.components = append(rt.components, componentRef{kind: "adm", name: admName})
+			built.components = append(built.components, componentRef{kind: "adm", name: admName})
 			svcCfg.Admissions = []string{admName}
 		}
 		svc, perr := service_parser.ParseService(svcCfg)
 		if perr != nil {
 			return nil, fmt.Errorf("parse service %s: %w", name, perr)
 		}
-		rt.services = append(rt.services, &svcRef{name: name, svc: svc})
+		built.services = append(built.services, &svcRef{name: name, svc: svc})
 	}
-	return rt, nil
+	return built, nil
 }
 
 // serveRule runs one gost service with panic isolation: a single rule's
