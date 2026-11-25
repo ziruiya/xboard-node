@@ -367,6 +367,26 @@ func (m *Manager) ackLocked(version int, hash string, applied bool, errText stri
 //      AUTOMATICALLY RESTORED from its spec if the new start fails;
 //   3. removed rules close last, so a mid-apply failure never removes
 //      service the document still wants gone only on success.
+//
+// GPT round 2, B02 (whole-document atomicity): R04's phases were atomic
+// per RULE, not per DOCUMENT — a multi-rule apply that failed halfway
+// left the rules it had already switched running their NEW specs: a
+// mixed ruleset that is neither the old document nor the new one. The
+// apply below treats the document as one atomic unit:
+//   A. every fresh rule and every disjoint swap is STAGED — built,
+//      started and serve-verified WITHOUT registering it and without
+//      closing anything it will replace; any failure tears down all
+//      staged runtimes and the confirmed ruleset is untouched;
+//   B. overlapping swaps (which cannot be staged — the new runtime
+//      cannot bind until the old one closes) run one by one, each
+//      individually restored on failure as in R04; if one fails, the
+//      swaps already completed in this phase are REVERSED back to
+//      their old specs and the staged set is torn down;
+//   C. only when A and B have fully succeeded does the commit register
+//      the staged runtimes, close the disjoint-swap predecessors and
+//      close the removals.
+// A failed apply therefore leaves the machine serving exactly the last
+// confirmed document, rule for rule.
 func (m *Manager) apply(ctx context.Context, doc *panel.RelayDocument) error {
 	draining := !doc.RelayEnabled || doc.MachineStatus == "DRAINING"
 	desired := make(map[string]panel.RelayRule)
@@ -419,33 +439,75 @@ func (m *Manager) apply(ctx context.Context, doc *panel.RelayDocument) error {
 		}
 	}
 
-	// Phase 1: fresh rules. Nothing has been closed yet; a failure
-	// leaves the entire old ruleset serving.
+	// Stage A (B02): stage every fresh rule and every disjoint swap —
+	// build, start and serve-verify the new runtimes WITHOUT
+	// registering them and without closing anything they will replace.
+	// The confirmed ruleset keeps serving untouched throughout; any
+	// failure tears down everything staged and aborts.
+	type stagedSwap struct {
+		old *ruleRuntime
+		rt  *ruleRuntime
+	}
+	var stagedFresh []*ruleRuntime
+	var stagedDisjoint []stagedSwap
+	teardownStaged := func() {
+		for _, rt := range stagedFresh {
+			m.closeRuntimeLocked(rt)
+		}
+		for _, s := range stagedDisjoint {
+			m.closeRuntimeLocked(s.rt)
+		}
+	}
 	for _, spec := range fresh {
-		if err := m.startOneLocked(spec); err != nil {
+		rt, err := m.startRuntimeLocked(spec)
+		if err != nil {
+			teardownStaged()
 			m.mu.Unlock()
 			return err
 		}
+		stagedFresh = append(stagedFresh, rt)
+	}
+	for _, sw := range swaps {
+		if socketsOverlap(sw.old.spec, sw.spec) {
+			continue // stage B: cannot be staged, the sockets collide
+		}
+		// Make-before-break: the new runtime binds disjoint sockets, so
+		// it can prove itself while the old one keeps serving.
+		rt, err := m.startRuntimeLocked(sw.spec)
+		if err != nil {
+			teardownStaged()
+			m.mu.Unlock()
+			return err
+		}
+		stagedDisjoint = append(stagedDisjoint, stagedSwap{old: sw.old, rt: rt})
 	}
 
-	// Phase 2: swaps.
-	for _, sw := range swaps {
-		code := sw.spec.RuleCode
-		if !socketsOverlap(sw.old.spec, sw.spec) {
-			// Make-before-break: the new runtime binds disjoint
-			// sockets, so it can prove itself before the old one is
-			// closed. A start failure leaves the old rule serving.
-			if err := m.startOneLocked(sw.spec); err != nil {
-				m.mu.Unlock()
-				return err
+	// Stage B (B02): overlapping swaps, one by one. Each swap closes
+	// its old runtime first (the new one cannot bind otherwise) and
+	// restores it if the new start fails (R04). If any swap fails, the
+	// swaps already completed in this stage are REVERSED to their old
+	// specs and the staged set is torn down: the machine returns to
+	// exactly the last confirmed ruleset instead of a mixture.
+	var doneOverlap []swap
+	reverseOverlap := func() {
+		for i := len(doneOverlap) - 1; i >= 0; i-- {
+			sw := doneOverlap[i]
+			code := sw.spec.RuleCode
+			if cur, ok := m.running[code]; ok {
+				m.closeRuntimeLocked(cur)
+				delete(m.running, code)
 			}
-			m.closeRuntimeLocked(sw.old)
-			continue
+			if rerr := m.restoreLocked(sw.old); rerr != nil {
+				nlog.Core().Error("relay apply rollback: reversing a completed swap failed",
+					"rule", code, "error", rerr)
+			}
 		}
-		// Overlapping sockets (same listen port — the retarget case):
-		// the old listener must close before the new one can bind. If
-		// the new start fails, restore the old runtime from its spec
-		// so the rule keeps serving its previous target.
+	}
+	for _, sw := range swaps {
+		if !socketsOverlap(sw.old.spec, sw.spec) {
+			continue // staged in A
+		}
+		code := sw.spec.RuleCode
 		m.closeRuntimeLocked(sw.old)
 		delete(m.running, code)
 		if err := m.startOneLocked(sw.spec); err != nil {
@@ -455,12 +517,24 @@ func (m *Manager) apply(ctx context.Context, doc *panel.RelayDocument) error {
 			} else {
 				nlog.Core().Warn("relay rule swap failed, old runtime restored", "rule", code, "error", err)
 			}
+			reverseOverlap()
+			teardownStaged()
 			m.mu.Unlock()
 			return err
 		}
+		doneOverlap = append(doneOverlap, sw)
 	}
 
-	// Phase 3: removals close last.
+	// Commit (B02): everything new is proven. Register the staged
+	// runtimes, close the disjoint-swap predecessors they replace, and
+	// close the removals last.
+	for _, rt := range stagedFresh {
+		m.running[rt.spec.RuleCode] = rt
+	}
+	for _, s := range stagedDisjoint {
+		m.running[s.rt.spec.RuleCode] = s.rt
+		m.closeRuntimeLocked(s.old)
+	}
 	for _, rt := range removed {
 		m.closeRuntimeLocked(rt)
 		delete(m.running, rt.spec.RuleCode)
@@ -604,25 +678,28 @@ func (m *Manager) ensureGostInit() {
 	})
 }
 
-// startOneLocked builds and starts one rule's gost services through
-// the config parser and verifies they actually serve. Services are held
-// directly by the manager and never registered in the global service
-// registry: loader.Load's group replacement closes every previously
-// registered service, which would kill unrelated rules on any change
-// (found in the HK2 pilot, 2026-11-25).
+// startRuntimeLocked builds and starts one rule's gost services
+// through the config parser and verifies they actually serve, WITHOUT
+// registering the runtime in m.running — the caller decides when (and
+// whether) the verified runtime joins the serving set. Services are
+// held directly by the manager and never registered in the global
+// service registry: loader.Load's group replacement closes every
+// previously registered service, which would kill unrelated rules on
+// any change (found in the HK2 pilot, 2026-11-25).
 //
 // R04: on ANY failure the half-started runtime is torn down completely
-// (services closed, components unregistered, running entry removed) —
-// the previous batch starter left a failed rule sitting in m.running,
-// where later syncs mistook it for a live one. Caller holds m.mu.
-func (m *Manager) startOneLocked(spec panel.RelayRule) error {
+// (services closed, components unregistered) before the error returns.
+// B02: registration used to happen here, before the serve check — an
+// unverified runtime sat in m.running where later syncs could mistake
+// it for a live one, and apply() could not stage several new runtimes
+// without committing each one as it went. Caller holds m.mu.
+func (m *Manager) startRuntimeLocked(spec panel.RelayRule) (*ruleRuntime, error) {
 	m.ensureGostInit()
 	gen := m.genCounter.Add(1)
 	rt, err := m.buildRule(spec, gen)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	m.running[spec.RuleCode] = rt
 	for _, ref := range rt.services {
 		go m.serveRule(rt, ref)
 	}
@@ -631,10 +708,20 @@ func (m *Manager) startOneLocked(spec panel.RelayRule) error {
 	for _, ref := range rt.services {
 		if v := ref.err.Load(); v != nil {
 			m.closeRuntimeLocked(rt)
-			delete(m.running, spec.RuleCode)
-			return fmt.Errorf("rule %s service %s: %s", spec.RuleCode, ref.name, v.(string))
+			return nil, fmt.Errorf("rule %s service %s: %s", spec.RuleCode, ref.name, v.(string))
 		}
 	}
+	return rt, nil
+}
+
+// startOneLocked starts one rule and registers its verified runtime.
+// Caller holds m.mu.
+func (m *Manager) startOneLocked(spec panel.RelayRule) error {
+	rt, err := m.startRuntimeLocked(spec)
+	if err != nil {
+		return err
+	}
+	m.running[spec.RuleCode] = rt
 	return nil
 }
 
@@ -643,24 +730,12 @@ func (m *Manager) startOneLocked(spec panel.RelayRule) error {
 // the old one's crash-restart history so backoff accounting survives
 // the swap attempt. Caller holds m.mu.
 func (m *Manager) restoreLocked(old *ruleRuntime) error {
-	gen := m.genCounter.Add(1)
-	rt, err := m.buildRule(old.spec, gen)
+	rt, err := m.startRuntimeLocked(old.spec)
 	if err != nil {
 		return err
 	}
 	rt.restarts = old.restarts
 	m.running[old.spec.RuleCode] = rt
-	for _, ref := range rt.services {
-		go m.serveRule(rt, ref)
-	}
-	time.Sleep(250 * time.Millisecond)
-	for _, ref := range rt.services {
-		if v := ref.err.Load(); v != nil {
-			m.closeRuntimeLocked(rt)
-			delete(m.running, old.spec.RuleCode)
-			return fmt.Errorf("restore rule %s service %s: %s", old.spec.RuleCode, ref.name, v.(string))
-		}
-	}
 	return nil
 }
 

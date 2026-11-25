@@ -438,6 +438,253 @@ func TestApplySameListenFailureRestoresOldRule(t *testing.T) {
 	}
 }
 
+// GPT round 2, B02 fault injection (fresh rules, partial start): v2
+// adds TWO fresh rules; the second one's listen port is occupied, so
+// its start fails. Round-1 apply had already registered the first new
+// rule by then — the machine ran a ruleset that was neither v1 nor v2.
+// The staged apply must leave NO trace of v2: the first new rule must
+// not be serving, the original rule must be untouched, and the version
+// must be acked as failed.
+func TestApplyMultiRuleFailureLeavesNoPartialRuleset(t *testing.T) {
+	echoPort := freePort(t)
+	startEcho(t, echoPort, "E:")
+	portA := freePort(t)
+	portB := freePort(t)
+	portC := freePort(t)
+
+	// Occupy portC for the whole test: the second fresh rule's target.
+	blocker, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", portC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Close()
+
+	mp := &mockPanel{booked: make(map[string]bool)}
+	srv := httptest.NewServer(mp.handler())
+	defer srv.Close()
+	client := panel.NewClient(config.PanelConfig{URL: srv.URL, Token: "tok", MachineID: 99})
+	m := NewManager(client, 99, t.TempDir())
+	m.loadState()
+	ctx := context.Background()
+
+	mkRule := func(code string, port int) panel.RelayRule {
+		return panel.RelayRule{
+			RuleCode: code, Name: code, Transport: "tcp",
+			ListenIP: "127.0.0.1", ListenPort: port,
+			TargetType: "MANUAL", TargetHost: "127.0.0.1", TargetPort: echoPort,
+			MaxConnections: 500, UDPMaxSessions: 512,
+			UDPIdleTimeoutSec: 60, DrainTimeoutSec: 5, BufferBytes: 32768,
+		}
+	}
+	doc := func(rules ...panel.RelayRule) *panel.RelayDocument {
+		return &panel.RelayDocument{
+			Protocol: "relay.config.v1", MachineID: 99, RelayEnabled: true,
+			MachineStatus: "ENABLED", Rules: rules,
+		}
+	}
+	// Rule codes sort RL000301 < RL000302 < RL000303, so the failing
+	// rule (303, occupied port) is staged AFTER the good new rule (302).
+	ruleA := mkRule("RL000301", portA)
+	ruleB := mkRule("RL000302", portB)
+	ruleC := mkRule("RL000303", portC)
+
+	mp.setDoc(1, doc(ruleA))
+	m.syncOnce(ctx)
+	addrA := fmt.Sprintf("127.0.0.1:%d", portA)
+	if got := tcpRoundTrip(t, addrA, "one"); got != "E:one" {
+		t.Fatalf("v1 echo = %q, want E:one", got)
+	}
+
+	mp.setDoc(2, doc(ruleA, ruleB, ruleC))
+	m.syncOnce(ctx)
+	ack := mp.lastAck()
+	if ack == nil || ack["applied"] != false || int(ack["version"].(float64)) != 2 {
+		t.Fatalf("v2 ack = %v, want failed v2", ack)
+	}
+	// The good new rule from the failed document must NOT be serving:
+	// the machine is back on exactly the v1 ruleset.
+	addrB := fmt.Sprintf("127.0.0.1:%d", portB)
+	if c, err := net.DialTimeout("tcp", addrB, time.Second); err == nil {
+		c.Close()
+		t.Fatal("rule B from the failed v2 is serving — partial apply leaked a staged rule")
+	}
+	m.mu.Lock()
+	_, bRunning := m.running["RL000302"]
+	_, cRunning := m.running["RL000303"]
+	m.mu.Unlock()
+	if bRunning || cRunning {
+		t.Fatalf("failed v2 left rules registered (B=%v C=%v)", bRunning, cRunning)
+	}
+	if got := tcpRoundTrip(t, addrA, "two"); got != "E:two" {
+		t.Fatalf("original rule after failed v2 = %q, want E:two", got)
+	}
+}
+
+// GPT round 2, B02 fault injection (multiple disjoint swaps): v2 moves
+// BOTH rules to new listen ports; the second move's port is occupied.
+// Round-1 apply committed the first swap (old listener closed) before
+// the second failed. The staged apply must leave both rules on their
+// ORIGINAL ports and targets.
+func TestApplyMultiSwapFailureKeepsAllOldRules(t *testing.T) {
+	echoPort := freePort(t)
+	startEcho(t, echoPort, "E:")
+	portA1, portA2 := freePort(t), freePort(t)
+	portB1, portB2 := freePort(t), freePort(t)
+
+	// Occupy portB2: the second swap's destination.
+	blocker, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", portB2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Close()
+
+	mp := &mockPanel{booked: make(map[string]bool)}
+	srv := httptest.NewServer(mp.handler())
+	defer srv.Close()
+	client := panel.NewClient(config.PanelConfig{URL: srv.URL, Token: "tok", MachineID: 99})
+	m := NewManager(client, 99, t.TempDir())
+	m.loadState()
+	ctx := context.Background()
+
+	mkRule := func(code string, port int) panel.RelayRule {
+		return panel.RelayRule{
+			RuleCode: code, Name: code, Transport: "tcp",
+			ListenIP: "127.0.0.1", ListenPort: port,
+			TargetType: "MANUAL", TargetHost: "127.0.0.1", TargetPort: echoPort,
+			MaxConnections: 500, UDPMaxSessions: 512,
+			UDPIdleTimeoutSec: 60, DrainTimeoutSec: 5, BufferBytes: 32768,
+		}
+	}
+	doc := func(rules ...panel.RelayRule) *panel.RelayDocument {
+		return &panel.RelayDocument{
+			Protocol: "relay.config.v1", MachineID: 99, RelayEnabled: true,
+			MachineStatus: "ENABLED", Rules: rules,
+		}
+	}
+	// Swaps are processed in rule-code order: A (RL000311) stages fine,
+	// B (RL000312) hits the occupied port.
+	mp.setDoc(1, doc(mkRule("RL000311", portA1), mkRule("RL000312", portB1)))
+	m.syncOnce(ctx)
+	addrA1 := fmt.Sprintf("127.0.0.1:%d", portA1)
+	addrB1 := fmt.Sprintf("127.0.0.1:%d", portB1)
+	if got := tcpRoundTrip(t, addrA1, "a1"); got != "E:a1" {
+		t.Fatalf("v1 A echo = %q, want E:a1", got)
+	}
+	if got := tcpRoundTrip(t, addrB1, "b1"); got != "E:b1" {
+		t.Fatalf("v1 B echo = %q, want E:b1", got)
+	}
+
+	mp.setDoc(2, doc(mkRule("RL000311", portA2), mkRule("RL000312", portB2)))
+	m.syncOnce(ctx)
+	ack := mp.lastAck()
+	if ack == nil || ack["applied"] != false || int(ack["version"].(float64)) != 2 {
+		t.Fatalf("v2 ack = %v, want failed v2", ack)
+	}
+	// BOTH rules must still serve on their original ports...
+	if got := tcpRoundTrip(t, addrA1, "a2"); got != "E:a2" {
+		t.Fatalf("A after failed v2 = %q, want E:a2 (first swap must not stay committed)", got)
+	}
+	if got := tcpRoundTrip(t, addrB1, "b2"); got != "E:b2" {
+		t.Fatalf("B after failed v2 = %q, want E:b2", got)
+	}
+	// ...and A's staged new port must not be serving either.
+	addrA2 := fmt.Sprintf("127.0.0.1:%d", portA2)
+	if c, err := net.DialTimeout("tcp", addrA2, time.Second); err == nil {
+		c.Close()
+		t.Fatal("A's staged v2 listener is still up after the failed apply")
+	}
+}
+
+// GPT round 2, B02 fault injection (multiple overlapping swaps): both
+// rules retarget on the SAME listen ports (overlap). The first swap
+// succeeds; the second fails because its widened transport cannot bind
+// the test-held UDP socket. The first swap must be REVERSED to its old
+// target, the second restored to its old spec — the whole machine back
+// on the v1 ruleset.
+func TestApplyMultiOverlapSwapFailureReversesCompletedSwaps(t *testing.T) {
+	echoA := freePort(t)
+	startEcho(t, echoA, "A:")
+	echoB := freePort(t)
+	startEcho(t, echoB, "B:")
+	portR1 := freePort(t)
+	portR2 := freePort(t)
+
+	// Occupy the UDP side of portR2: rule 2's widened runtime cannot bind.
+	udpBlock, err := net.ListenPacket("udp", fmt.Sprintf("127.0.0.1:%d", portR2))
+	if err != nil {
+		t.Fatalf("udp blocker: %v", err)
+	}
+	defer udpBlock.Close()
+
+	mp := &mockPanel{booked: make(map[string]bool)}
+	srv := httptest.NewServer(mp.handler())
+	defer srv.Close()
+	client := panel.NewClient(config.PanelConfig{URL: srv.URL, Token: "tok", MachineID: 99})
+	m := NewManager(client, 99, t.TempDir())
+	m.loadState()
+	ctx := context.Background()
+
+	mkRule := func(code string, port int, transport string, target int) panel.RelayRule {
+		return panel.RelayRule{
+			RuleCode: code, Name: code, Transport: transport,
+			ListenIP: "127.0.0.1", ListenPort: port,
+			TargetType: "MANUAL", TargetHost: "127.0.0.1", TargetPort: target,
+			MaxConnections: 500, UDPMaxSessions: 512,
+			UDPIdleTimeoutSec: 60, DrainTimeoutSec: 5, BufferBytes: 32768,
+		}
+	}
+	doc := func(rules ...panel.RelayRule) *panel.RelayDocument {
+		return &panel.RelayDocument{
+			Protocol: "relay.config.v1", MachineID: 99, RelayEnabled: true,
+			MachineStatus: "ENABLED", Rules: rules,
+		}
+	}
+	addr1 := fmt.Sprintf("127.0.0.1:%d", portR1)
+	addr2 := fmt.Sprintf("127.0.0.1:%d", portR2)
+
+	// v1: both rules tcp, both targeting echo A.
+	mp.setDoc(1, doc(mkRule("RL000321", portR1, "tcp", echoA), mkRule("RL000322", portR2, "tcp", echoA)))
+	m.syncOnce(ctx)
+	if got := tcpRoundTrip(t, addr1, "one"); got != "A:one" {
+		t.Fatalf("v1 rule1 echo = %q, want A:one", got)
+	}
+	if got := tcpRoundTrip(t, addr2, "one"); got != "A:one" {
+		t.Fatalf("v1 rule2 echo = %q, want A:one", got)
+	}
+
+	// v2: rule 1 retargets to B (overlap swap, succeeds); rule 2 widens
+	// to "both" (UDP blocked) and retargets to B (overlap swap, fails).
+	mp.setDoc(2, doc(mkRule("RL000321", portR1, "tcp", echoB), mkRule("RL000322", portR2, "both", echoB)))
+	m.syncOnce(ctx)
+	ack := mp.lastAck()
+	if ack == nil || ack["applied"] != false || int(ack["version"].(float64)) != 2 {
+		t.Fatalf("v2 ack = %v, want failed v2", ack)
+	}
+	// Rule 1's completed swap must have been REVERSED: old target A.
+	if got := tcpRoundTrip(t, addr1, "two"); got != "A:two" {
+		t.Fatalf("rule1 after failed v2 = %q, want A:two (completed swap must be reversed)", got)
+	}
+	// Rule 2 restored to its old spec: old target A.
+	if got := tcpRoundTrip(t, addr2, "two"); got != "A:two" {
+		t.Fatalf("rule2 after failed v2 = %q, want A:two (failed swap must restore)", got)
+	}
+
+	// v3: both retarget to B over tcp — applies cleanly over the
+	// rolled-back state.
+	mp.setDoc(3, doc(mkRule("RL000321", portR1, "tcp", echoB), mkRule("RL000322", portR2, "tcp", echoB)))
+	m.syncOnce(ctx)
+	ack = mp.lastAck()
+	if ack == nil || ack["applied"] != true || int(ack["version"].(float64)) != 3 {
+		t.Fatalf("v3 ack = %v, want applied v3", ack)
+	}
+	if got := tcpRoundTrip(t, addr1, "three"); got != "B:three" {
+		t.Fatalf("v3 rule1 echo = %q, want B:three", got)
+	}
+	if got := tcpRoundTrip(t, addr2, "three"); got != "B:three" {
+		t.Fatalf("v3 rule2 echo = %q, want B:three", got)
+	}
+}
+
 // ─── the end-to-end test ─────────────────────────────────────────────
 
 func TestManagerEndToEnd(t *testing.T) {
