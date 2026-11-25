@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -269,6 +270,16 @@ func (t *Tracker) EnablePersistence(path string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.storePath = path
+	// The store directory is not guaranteed to exist: in machine
+	// mode a per-node ConfigDir (…/instances/…/node-<id>/) may never
+	// have been created, and then every persist fails with "no such
+	// file or directory", silently leaving that node's batches
+	// unpersisted. Create the directory up front; a failure here is
+	// still best-effort — log it and let reporting continue in
+	// memory, as with any other persistence failure.
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		nlog.Core().Warn("tracker: failed to create traffic batch store directory", "path", filepath.Dir(path), "error", err)
+	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return // no leftover batch (the common case)

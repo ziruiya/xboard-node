@@ -5,6 +5,7 @@ package tracker
 // instead of silently losing the last traffic window.
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -55,6 +56,42 @@ func TestUnackedBatchSurvivesRestart(t *testing.T) {
 	t3.EnablePersistence(path)
 	if t3.Unacked() != nil {
 		t.Fatal("acked batch resurrected on a later restart")
+	}
+}
+
+// Regression (SG pilot): in machine mode one node's per-node
+// ConfigDir (…/instances/…/node-<id>/) was never created, so every
+// persist failed with "no such file or directory" and that node's
+// batches were never written. EnablePersistence must create the
+// store directory itself.
+func TestEnablePersistenceCreatesMissingStoreDir(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "instances", "node-6", "traffic-batch-6.json")
+
+	t1 := New()
+	t1.EnablePersistence(path)
+	if info, err := os.Stat(filepath.Dir(path)); err != nil || !info.IsDir() {
+		t.Fatalf("store directory not created by EnablePersistence (err = %v)", err)
+	}
+
+	t1.Process(map[int][2]int64{3: {11, 22}}, nil, 0)
+	b := t1.FlushBatch()
+	if b == nil {
+		t.Fatal("FlushBatch returned nil")
+	}
+	t1.SetUnacked(b)
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("persisted batch file not readable: %v", err)
+	}
+	var bs batchStore
+	if err := json.Unmarshal(raw, &bs); err != nil {
+		t.Fatalf("persisted batch file undecodable: %v", err)
+	}
+	if bs.ID != b.ID || bs.CollectedFrom != b.CollectedFrom || bs.CollectedTo != b.CollectedTo ||
+		len(bs.Data) != 1 || bs.Data[3] != [2]int64{11, 22} {
+		t.Fatalf("persisted batch = %+v, want ID %q, window [%d,%d], user 3 {11 22}",
+			bs, b.ID, b.CollectedFrom, b.CollectedTo)
 	}
 }
 
