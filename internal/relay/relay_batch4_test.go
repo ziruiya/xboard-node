@@ -157,6 +157,64 @@ func TestSettleChunkKeepsQueueOnUnreconcilableVerdict(t *testing.T) {
 	}
 }
 
+// NODE-002 (residual): the counts adding up is not enough — a verdict
+// naming a batch that was never in the sent chunk proves nothing
+// about the batches that were sent, so nothing may settle.
+func TestSettleChunkRejectsVerdictNamingForeignBatch(t *testing.T) {
+	m := NewManager(nil, 99, t.TempDir())
+	a1 := batch("RL000001", 1, 10)
+	a2 := batch("RL000001", 2, 20)
+	m.state = &diskState{
+		Banked:   map[string]counters{},
+		Reported: map[string]counters{},
+		NextSeq:  map[string]int64{},
+		Pending:  []panel.RelayTrafficBatch{a1, a2},
+	}
+
+	res := &panel.RelayTrafficResult{
+		Accepted: 1, Rejected: 1, // counts add up…
+		RejectedBatches: []panel.RelayRejectedBatch{
+			{RuleCode: "RL000001", BootID: "boot-1", Seq: 99, Reason: "unknown_rule"}, // …but this batch was never sent
+		},
+	}
+	if m.settleChunk([]panel.RelayTrafficBatch{a1, a2}, res) {
+		t.Fatal("verdict naming a foreign batch must not settle the chunk")
+	}
+	if got := pendingSeqs(m); len(got) != 2 {
+		t.Fatalf("pending = %v, want both batches kept", got)
+	}
+}
+
+// NODE-002 (residual): the same batch named twice in rejected_batches
+// must not settle either — the named identities must be exactly the
+// rejected count, each one distinct and inside the chunk.
+func TestSettleChunkRejectsVerdictNamingDuplicateBatch(t *testing.T) {
+	m := NewManager(nil, 99, t.TempDir())
+	a1 := batch("RL000001", 1, 10)
+	a2 := batch("RL000001", 2, 20)
+	a3 := batch("RL000001", 3, 30)
+	m.state = &diskState{
+		Banked:   map[string]counters{},
+		Reported: map[string]counters{},
+		NextSeq:  map[string]int64{},
+		Pending:  []panel.RelayTrafficBatch{a1, a2, a3},
+	}
+
+	res := &panel.RelayTrafficResult{
+		Accepted: 1, Rejected: 2, // counts add up, two names given…
+		RejectedBatches: []panel.RelayRejectedBatch{
+			{RuleCode: "RL000001", BootID: "boot-1", Seq: 2, Reason: "unknown_rule"},
+			{RuleCode: "RL000001", BootID: "boot-1", Seq: 2, Reason: "unknown_rule"}, // …but it is the same batch twice
+		},
+	}
+	if m.settleChunk([]panel.RelayTrafficBatch{a1, a2, a3}, res) {
+		t.Fatal("verdict naming the same batch twice must not settle the chunk")
+	}
+	if got := pendingSeqs(m); len(got) != 3 {
+		t.Fatalf("pending = %v, want all three batches kept", got)
+	}
+}
+
 // NODE-003: overlapping flushes (timer vs shutdown) are serialized
 // and settle by identity — no batch is lost or double-booked.
 func TestConcurrentFlushesLoseNothing(t *testing.T) {

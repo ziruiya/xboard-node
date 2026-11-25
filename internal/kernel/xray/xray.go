@@ -341,27 +341,26 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 	nc := x.nodeConfig
 	x.mu.Unlock()
 
-	ctx := context.Background()
-	// NODE-013: revoke rotated users' old identities first (same
-	// ID-derived email), then add them back with the new credential.
-	for _, u := range rotated {
-		if err := um.RemoveUser(ctx, userEmail(u.ID)); err != nil {
-			nlog.Core().Warn("xray: RemoveUser (rotation) failed", "user", u.ID, "error", err)
-		}
-	}
-	toAdd = append(toAdd, rotated...)
-	added := 0
-	for _, u := range toAdd {
-		mu, err := toMemoryUser(proto, nc, u)
-		if err != nil {
-			nlog.Core().Warn("xray: skip user, cannot build account", "user", u.ID, "error", err)
-			continue
-		}
-		if err := um.AddUser(ctx, mu); err != nil {
-			nlog.Core().Warn("xray: AddUser failed", "user", u.ID, "error", err)
-			continue
-		}
-		added++
+	return x.applyAddUsersUM(um, proto, nc, toAdd, rotated, merged)
+}
+
+// applyAddUsersUM drives the running kernel to the merged user set
+// for an incremental add: rotated users' old identities are revoked
+// first (same ID-derived email), then new and rotated users are
+// added through the same all-or-nothing seam as UpdateUsers.
+//
+// NODE-013 (residual): the previous implementation warned and
+// continued on revoke/build/add failures, then advanced the snapshot
+// anyway — the old credential could keep authenticating while
+// bookkeeping claimed the new set. Here any failure is returned and
+// x.users is NOT advanced; the caller falls back to a full rebuild,
+// which converges kernel and snapshot together.
+func (x *Xray) applyAddUsersUM(um xrayProxy.UserManager, proto string, nc *model.NodeSpec, toAdd, rotated, merged []model.UserSpec) (int, error) {
+	all := make([]model.UserSpec, 0, len(toAdd)+len(rotated))
+	all = append(all, toAdd...)
+	all = append(all, rotated...)
+	if err := applyUserSyncUM(context.Background(), um, proto, nc, all, rotated); err != nil {
+		return 0, fmt.Errorf("xray: add users incomplete: %w", err)
 	}
 
 	// Update bookkeeping with full merged list (new users + updated properties).
@@ -371,8 +370,8 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 	x.updateDispatcherLimits(merged)
 	x.updateBandwidthLimits(merged)
 
-	nlog.Core().Info("xray: users added via UserManager", "added", added, "total", len(merged))
-	return added, nil
+	nlog.Core().Info("xray: users added via UserManager", "added", len(all), "total", len(merged))
+	return len(all), nil
 }
 
 // RemoveUsers removes users from the running kernel via xray's UserManager API.

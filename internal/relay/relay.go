@@ -1116,16 +1116,46 @@ func keyOf(b panel.RelayTrafficBatch) batchKey {
 // the chunk (counts disagree, or rejections without per-batch names
 // from a pre-ER-014 panel): the chunk then stays fully queued and the
 // flush stops, rather than guessing which batches died.
+//
+// NODE-002 (residual): the counts adding up is not enough — every
+// batch named in rejected_batches must actually belong to this chunk
+// and be named at most once. A verdict naming a foreign or duplicate
+// batch proves nothing about the batches that were sent, so it is
+// unreconcilable as a whole and the chunk stays queued.
 func (m *Manager) settleChunk(chunk []panel.RelayTrafficBatch, res *panel.RelayTrafficResult) bool {
+	if res.Accepted < 0 || res.Duplicates < 0 || res.Rejected < 0 {
+		nlog.Core().Error("relay traffic verdict has negative counts, keeping chunk queued",
+			"chunk", len(chunk), "accepted", res.Accepted, "duplicates", res.Duplicates, "rejected", res.Rejected)
+		return false
+	}
 	if res.Accepted+res.Duplicates+res.Rejected != len(chunk) {
 		nlog.Core().Error("relay traffic verdict does not add up, keeping chunk queued",
 			"chunk", len(chunk), "accepted", res.Accepted, "duplicates", res.Duplicates, "rejected", res.Rejected)
 		return false
 	}
-	if res.Rejected > 0 && len(res.RejectedBatches) != res.Rejected {
+	if len(res.RejectedBatches) != res.Rejected {
 		nlog.Core().Error("relay traffic rejections without per-batch verdicts, keeping chunk queued",
 			"chunk", len(chunk), "rejected", res.Rejected, "named", len(res.RejectedBatches))
 		return false
+	}
+	inChunk := make(map[batchKey]bool, len(chunk))
+	for _, b := range chunk {
+		inChunk[keyOf(b)] = true
+	}
+	named := make(map[batchKey]bool, len(res.RejectedBatches))
+	for _, rb := range res.RejectedBatches {
+		k := batchKey{rule: rb.RuleCode, boot: rb.BootID, seq: rb.Seq}
+		if !inChunk[k] {
+			nlog.Core().Error("relay traffic verdict names a batch outside the sent chunk, keeping chunk queued",
+				"rule", rb.RuleCode, "boot_id", rb.BootID, "seq", rb.Seq)
+			return false
+		}
+		if named[k] {
+			nlog.Core().Error("relay traffic verdict names the same batch twice, keeping chunk queued",
+				"rule", rb.RuleCode, "boot_id", rb.BootID, "seq", rb.Seq)
+			return false
+		}
+		named[k] = true
 	}
 
 	settled := make(map[batchKey]bool, len(chunk))

@@ -868,23 +868,51 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 			return
 		}
 
+		// NODE-013 (residual): the rotation pre-delete revokes the old
+		// credential ahead of the incremental add. Its result must be
+		// checked — silently ignoring a failed revoke would let this
+		// path claim success while the old credential stays valid. On
+		// failure, skip the incremental path entirely and converge
+		// through the full rebuild below.
+		preDeleteFailed := false
 		for _, delta := range deltaUsers {
 			for _, old := range s.lastUsers {
 				if old.ID == delta.ID && old.UUID != delta.UUID {
-					s.kernel.RemoveUsers([]model.UserSpec{old})
+					if _, err := s.kernel.RemoveUsers([]model.UserSpec{old}); err != nil {
+						nlog.Core().Warn(fmt.Sprintf("rotation pre-delete failed for user %d: %v, falling back to full rebuild", old.ID, err))
+						preDeleteFailed = true
+					}
 					break
 				}
+			}
+			if preDeleteFailed {
+				break
 			}
 		}
 
 		prevUsers, prevHash := s.prepareUserState(merged)
-		added, err := s.kernel.AddUsers(deltaUsers)
-		if err != nil {
-			nlog.Core().Warn(fmt.Sprintf("AddUsers failed: %v, falling back to UpdateUsers", err))
+		added := 0
+		incrementalOK := false
+		if !preDeleteFailed {
+			var err error
+			added, err = s.kernel.AddUsers(deltaUsers)
+			if err != nil {
+				nlog.Core().Warn(fmt.Sprintf("AddUsers failed: %v, falling back to full rebuild", err))
+			} else {
+				incrementalOK = true
+			}
+		}
+		if !incrementalOK {
+			// Trusted full rebuild: full-set sync first, then a full
+			// kernel restart. Both results are checked — if the
+			// restart also fails, restore the pre-change state rather
+			// than claiming a convergence that did not happen.
 			if _, _, err := s.kernel.UpdateUsers(merged); err != nil {
-				nlog.Core().Error(fmt.Sprintf("UpdateUsers fallback failed: %v", err))
-				s.restoreUserState(prevUsers, prevHash)
-				return
+				nlog.Core().Warn(fmt.Sprintf("UpdateUsers fallback failed: %v, restarting kernel", err))
+				if !s.startKernel(s.lastConfig, merged) {
+					s.restoreUserState(prevUsers, prevHash)
+					return
+				}
 			}
 		}
 		if s.nodeLog != nil && added > 0 {

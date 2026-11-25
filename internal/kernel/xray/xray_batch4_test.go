@@ -22,8 +22,9 @@ import (
 // per email, AddUser fails when the email is already present,
 // RemoveUser fails when it is absent.
 type fakeUserManager struct {
-	accounts map[string]string // email -> UUID
-	failAdd  bool
+	accounts   map[string]string // email -> UUID
+	failAdd    bool
+	failRemove bool
 }
 
 func (f *fakeUserManager) AddUser(_ context.Context, mu *protocol.MemoryUser) error {
@@ -42,6 +43,9 @@ func (f *fakeUserManager) AddUser(_ context.Context, mu *protocol.MemoryUser) er
 }
 
 func (f *fakeUserManager) RemoveUser(_ context.Context, email string) error {
+	if f.failRemove {
+		return errors.New("remove disabled")
+	}
 	if _, exists := f.accounts[email]; !exists {
 		return errors.New("user not found")
 	}
@@ -120,5 +124,80 @@ func TestApplyUserSyncUMFailureIsReturned(t *testing.T) {
 		[]model.UserSpec{{ID: 2, UUID: uuidA}}, nil)
 	if err == nil {
 		t.Fatal("UserManager failure must be returned so UpdateUsers can refuse to advance its snapshot")
+	}
+}
+
+// NODE-013 (residual): AddUsers' incremental drive must be
+// all-or-nothing. GPT's reproducer: the rotation revoke fails, the
+// new credential then collides on add — the old warn-and-continue
+// code still advanced the snapshot and reported success, leaving the
+// old credential valid under new bookkeeping. The fix must return an
+// error and keep the snapshot on the old set.
+func TestAddUsersUMRotationRemoveAndAddFailureKeepsSnapshot(t *testing.T) {
+	um := &fakeUserManager{
+		accounts:   map[string]string{userEmail(1): uuidA},
+		failRemove: true, // delete of the old credential fails…
+		// …so the add of the new one collides on the same email.
+	}
+	x := &Xray{users: []model.UserSpec{{ID: 1, UUID: uuidA}}}
+	nc := &model.NodeSpec{Protocol: "vmess"}
+	merged := []model.UserSpec{{ID: 1, UUID: uuidB}}
+
+	_, err := x.applyAddUsersUM(um, "vmess", nc, nil,
+		[]model.UserSpec{{ID: 1, UUID: uuidB}}, merged)
+	if err == nil {
+		t.Fatal("failed rotation must return an error, not a false success")
+	}
+	if len(x.users) != 1 || x.users[0].UUID != uuidA {
+		t.Fatalf("snapshot advanced to %+v despite failed rotation, want the old set kept", x.users)
+	}
+	if got := um.accounts[userEmail(1)]; got != uuidA {
+		t.Fatalf("kernel account = %q, want the old credential %q untouched", got, uuidA)
+	}
+}
+
+// NODE-013 (residual): even when the revoke succeeds, a failing add
+// must surface as an error and must not advance the snapshot (the
+// caller's full rebuild is what re-converges kernel and snapshot).
+func TestAddUsersUMAddFailureKeepsSnapshot(t *testing.T) {
+	um := &fakeUserManager{
+		accounts: map[string]string{userEmail(1): uuidA},
+		failAdd:  true,
+	}
+	x := &Xray{users: []model.UserSpec{{ID: 1, UUID: uuidA}}}
+	nc := &model.NodeSpec{Protocol: "vmess"}
+	merged := []model.UserSpec{{ID: 1, UUID: uuidB}}
+
+	_, err := x.applyAddUsersUM(um, "vmess", nc, nil,
+		[]model.UserSpec{{ID: 1, UUID: uuidB}}, merged)
+	if err == nil {
+		t.Fatal("failed add must return an error, not a false success")
+	}
+	if len(x.users) != 1 || x.users[0].UUID != uuidA {
+		t.Fatalf("snapshot advanced to %+v despite failed add, want the old set kept", x.users)
+	}
+}
+
+// NODE-013 (residual), control case: a healthy rotation still goes
+// through hitlessly and advances the snapshot to the new credential.
+func TestAddUsersUMRotationSuccessAdvancesSnapshot(t *testing.T) {
+	um := &fakeUserManager{accounts: map[string]string{userEmail(1): uuidA}}
+	x := &Xray{users: []model.UserSpec{{ID: 1, UUID: uuidA}}}
+	nc := &model.NodeSpec{Protocol: "vmess"}
+	merged := []model.UserSpec{{ID: 1, UUID: uuidB}}
+
+	added, err := x.applyAddUsersUM(um, "vmess", nc, nil,
+		[]model.UserSpec{{ID: 1, UUID: uuidB}}, merged)
+	if err != nil {
+		t.Fatalf("healthy rotation error = %v, want nil", err)
+	}
+	if added != 1 {
+		t.Fatalf("added = %d, want 1", added)
+	}
+	if len(x.users) != 1 || x.users[0].UUID != uuidB {
+		t.Fatalf("snapshot = %+v, want the rotated set", x.users)
+	}
+	if got := um.accounts[userEmail(1)]; got != uuidB {
+		t.Fatalf("kernel account = %q, want the new credential %q", got, uuidB)
 	}
 }
