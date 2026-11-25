@@ -15,6 +15,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/monitor"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/panel"
+	"github.com/cedar2025/xboard-node/internal/relay"
 	"github.com/cedar2025/xboard-node/internal/service"
 )
 
@@ -86,6 +87,12 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	// Start machine-level WS as early as possible so sync.nodes can reach an
 	// empty machine before the first node is attached.
 	o.tryStartWS(ctx)
+
+	// SB-RELAY-01: the embedded gost relay data plane runs alongside the
+	// nodes. It stays completely idle until the panel publishes a relay
+	// config for this machine and enables it there.
+	relayMgr := relay.NewManager(o.client, o.cfg.Machine.MachineID, o.cfg.Kernel.ConfigDir, o.ownNodeIDs)
+	go relayMgr.Run(ctx)
 
 	// Start initial nodes.
 	for _, n := range nodesResp.Nodes {
@@ -250,6 +257,18 @@ func (o *Orchestrator) rediscover(ctx context.Context) {
 	for _, n := range nodesResp.Nodes {
 		o.startNode(ctx, n) // no-op if already running
 	}
+}
+
+// ownNodeIDs snapshots the node ids currently running on this machine.
+// The relay manager uses it for the same-machine loopback target rule.
+func (o *Orchestrator) ownNodeIDs() map[int]bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	out := make(map[int]bool, len(o.nodes))
+	for id := range o.nodes {
+		out[id] = true
+	}
+	return out
 }
 
 // ─── Machine status reporting ────────────────────────────────────────────
