@@ -231,7 +231,7 @@ func TestAddRuleDoesNotDisturbExisting(t *testing.T) {
 	defer srv.Close()
 
 	client := panel.NewClient(config.PanelConfig{URL: srv.URL, Token: "tok", MachineID: 99})
-	m := NewManager(client, 99, t.TempDir(), func() map[int]bool { return map[int]bool{} })
+	m := NewManager(client, 99, t.TempDir())
 	m.loadState()
 	ctx := context.Background()
 
@@ -298,7 +298,7 @@ func TestManagerEndToEnd(t *testing.T) {
 	defer srv.Close()
 
 	client := panel.NewClient(config.PanelConfig{URL: srv.URL, Token: "tok", MachineID: 99})
-	m := NewManager(client, 99, t.TempDir(), func() map[int]bool { return map[int]bool{} })
+	m := NewManager(client, 99, t.TempDir())
 	m.loadState()
 	ctx := context.Background()
 

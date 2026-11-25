@@ -186,7 +186,6 @@ type Manager struct {
 	client    *panel.Client
 	machineID int
 	stateDir  string
-	ownNodes  func() map[int]bool
 	bootID    string
 
 	mu             sync.Mutex
@@ -204,9 +203,8 @@ type Manager struct {
 
 // NewManager creates the relay manager. stateDir is where the durable
 // traffic state lives (the agent's kernel config dir, /etc/xboard-node
-// in production). ownNodes reports the node ids this machine runs, used
-// for the same-machine loopback target rule.
-func NewManager(client *panel.Client, machineID int, stateDir string, ownNodes func() map[int]bool) *Manager {
+// in production).
+func NewManager(client *panel.Client, machineID int, stateDir string) *Manager {
 	if stateDir == "" {
 		stateDir = os.TempDir()
 	}
@@ -216,7 +214,6 @@ func NewManager(client *panel.Client, machineID int, stateDir string, ownNodes f
 		client:    client,
 		machineID: machineID,
 		stateDir:  stateDir,
-		ownNodes:  ownNodes,
 		bootID:    "b" + hex.EncodeToString(rb[:]),
 		running:   make(map[string]*ruleRuntime),
 		zombies:   make(map[string][]*ruleRuntime),
@@ -537,8 +534,16 @@ func (m *Manager) buildRule(spec panel.RelayRule) (rt *ruleRuntime, err error) {
 		}
 	}()
 
-	host, port := m.effectiveTarget(spec)
-	targetAddr := net.JoinHostPort(host, strconv.Itoa(port))
+	// The panel publishes the rule's target as the final dial endpoint
+	// (for NODE targets: the hosting machine's public address + the
+	// node's effective landing port). The agent dials exactly what was
+	// published — there is deliberately no same-machine loopback
+	// shortcut: machine roles are exclusive (a machine is a landing
+	// machine or a relay machine, never both), so a relay machine never
+	// hosts its rules' target nodes, and a shortcut that silently
+	// rewrites the dial address is how the HK2 pilot masked the
+	// cross-machine addressing defect.
+	targetAddr := net.JoinHostPort(spec.TargetHost, strconv.Itoa(spec.TargetPort))
 
 	var transports []string
 	switch strings.ToLower(spec.Transport) {
@@ -669,22 +674,6 @@ func crashBackoffExceeded(rt *ruleRuntime) bool {
 }
 
 // ─── Rule → gost config ──────────────────────────────────────────────
-
-// effectiveTarget resolves where the forwarder actually dials. A NODE
-// target hosted on this very machine is dialed on loopback (the bytes
-// still terminate at the node's own listener, so TLS SNI / Reality
-// semantics — which live inside the forwarded stream — are untouched);
-// anything else uses the panel-published host, re-resolved by the
-// dialer on every connection.
-func (m *Manager) effectiveTarget(spec panel.RelayRule) (string, int) {
-	host, port := spec.TargetHost, spec.TargetPort
-	if spec.TargetType == "NODE" && spec.TargetNodeID != nil && m.ownNodes != nil {
-		if m.ownNodes()[*spec.TargetNodeID] {
-			host = "127.0.0.1"
-		}
-	}
-	return host, port
-}
 
 func normalizeRule(r panel.RelayRule) panel.RelayRule {
 	if r.AllowlistCIDRs == nil {
