@@ -284,6 +284,160 @@ func TestAddRuleDoesNotDisturbExisting(t *testing.T) {
 	}
 }
 
+// GPT review R04 fault injection (disjoint swap): v2 moves the rule to
+// a listen port the test itself occupies, so the new runtime cannot
+// bind. Make-before-break must leave the OLD rule serving on its old
+// port, the version must be acked as failed, and a later good version
+// must still apply cleanly.
+func TestApplyFailureKeepsOldRuleServing(t *testing.T) {
+	echoPort := freePort(t)
+	startEcho(t, echoPort, "E:")
+	portA := freePort(t)
+	portB := freePort(t)
+	portC := freePort(t)
+
+	// Occupy portB for the whole test: v2's bind target.
+	blocker, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", portB))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Close()
+
+	mp := &mockPanel{booked: make(map[string]bool)}
+	srv := httptest.NewServer(mp.handler())
+	defer srv.Close()
+	client := panel.NewClient(config.PanelConfig{URL: srv.URL, Token: "tok", MachineID: 99})
+	m := NewManager(client, 99, t.TempDir())
+	m.loadState()
+	ctx := context.Background()
+
+	mkRule := func(port int) panel.RelayRule {
+		return panel.RelayRule{
+			RuleCode: "RL000201", Name: "atomic", Transport: "tcp",
+			ListenIP: "127.0.0.1", ListenPort: port,
+			TargetType: "MANUAL", TargetHost: "127.0.0.1", TargetPort: echoPort,
+			MaxConnections: 500, UDPMaxSessions: 512,
+			UDPIdleTimeoutSec: 60, DrainTimeoutSec: 5, BufferBytes: 32768,
+		}
+	}
+	doc := func(r panel.RelayRule) *panel.RelayDocument {
+		return &panel.RelayDocument{
+			Protocol: "relay.config.v1", MachineID: 99, RelayEnabled: true,
+			MachineStatus: "ENABLED", Rules: []panel.RelayRule{r},
+		}
+	}
+
+	mp.setDoc(1, doc(mkRule(portA)))
+	m.syncOnce(ctx)
+	addrA := fmt.Sprintf("127.0.0.1:%d", portA)
+	if got := tcpRoundTrip(t, addrA, "one"); got != "E:one" {
+		t.Fatalf("v1 echo = %q, want E:one", got)
+	}
+
+	// v2: move to the occupied port — the apply must fail...
+	mp.setDoc(2, doc(mkRule(portB)))
+	m.syncOnce(ctx)
+	ack := mp.lastAck()
+	if ack == nil || ack["applied"] != false || int(ack["version"].(float64)) != 2 {
+		t.Fatalf("v2 ack = %v, want failed v2", ack)
+	}
+	// ...and the old rule must still be serving on portA.
+	if got := tcpRoundTrip(t, addrA, "two"); got != "E:two" {
+		t.Fatalf("old rule after failed v2 = %q, want E:two (old rule must survive a failed apply)", got)
+	}
+
+	// v3: move to a free port — applies; the old port then refuses.
+	mp.setDoc(3, doc(mkRule(portC)))
+	m.syncOnce(ctx)
+	ack = mp.lastAck()
+	if ack == nil || ack["applied"] != true || int(ack["version"].(float64)) != 3 {
+		t.Fatalf("v3 ack = %v, want applied v3", ack)
+	}
+	addrC := fmt.Sprintf("127.0.0.1:%d", portC)
+	if got := tcpRoundTrip(t, addrC, "three"); got != "E:three" {
+		t.Fatalf("v3 echo = %q, want E:three", got)
+	}
+	if c, err := net.DialTimeout("tcp", addrA, time.Second); err == nil {
+		c.Close()
+		t.Fatal("old listen port still accepts after successful move")
+	}
+}
+
+// GPT review R04 fault injection (overlapping swap): v2 keeps the same
+// listen port but widens the transport tcp -> both while the test holds
+// the UDP socket on that port, so the new runtime cannot fully start.
+// The old runtime must be restored automatically (old target serving
+// again) and the version acked as failed; v3 (tcp again, new target)
+// then applies.
+func TestApplySameListenFailureRestoresOldRule(t *testing.T) {
+	echoPortA := freePort(t)
+	startEcho(t, echoPortA, "A:")
+	echoPortB := freePort(t)
+	startEcho(t, echoPortB, "B:")
+	portR := freePort(t)
+
+	// Occupy the UDP side of portR: v2's "both" runtime cannot bind it.
+	udpBlock, err := net.ListenPacket("udp", fmt.Sprintf("127.0.0.1:%d", portR))
+	if err != nil {
+		t.Fatalf("udp blocker: %v", err)
+	}
+	defer udpBlock.Close()
+
+	mp := &mockPanel{booked: make(map[string]bool)}
+	srv := httptest.NewServer(mp.handler())
+	defer srv.Close()
+	client := panel.NewClient(config.PanelConfig{URL: srv.URL, Token: "tok", MachineID: 99})
+	m := NewManager(client, 99, t.TempDir())
+	m.loadState()
+	ctx := context.Background()
+
+	mkRule := func(transport string, target int) panel.RelayRule {
+		return panel.RelayRule{
+			RuleCode: "RL000202", Name: "restore", Transport: transport,
+			ListenIP: "127.0.0.1", ListenPort: portR,
+			TargetType: "MANUAL", TargetHost: "127.0.0.1", TargetPort: target,
+			MaxConnections: 500, UDPMaxSessions: 512,
+			UDPIdleTimeoutSec: 60, DrainTimeoutSec: 5, BufferBytes: 32768,
+		}
+	}
+	doc := func(r panel.RelayRule) *panel.RelayDocument {
+		return &panel.RelayDocument{
+			Protocol: "relay.config.v1", MachineID: 99, RelayEnabled: true,
+			MachineStatus: "ENABLED", Rules: []panel.RelayRule{r},
+		}
+	}
+	addr := fmt.Sprintf("127.0.0.1:%d", portR)
+
+	mp.setDoc(1, doc(mkRule("tcp", echoPortA)))
+	m.syncOnce(ctx)
+	if got := tcpRoundTrip(t, addr, "one"); got != "A:one" {
+		t.Fatalf("v1 echo = %q, want A:one", got)
+	}
+
+	// v2: same listen, transport widens to both (UDP blocked), target B.
+	mp.setDoc(2, doc(mkRule("both", echoPortB)))
+	m.syncOnce(ctx)
+	ack := mp.lastAck()
+	if ack == nil || ack["applied"] != false || int(ack["version"].(float64)) != 2 {
+		t.Fatalf("v2 ack = %v, want failed v2", ack)
+	}
+	// The old runtime must have been restored: old target, old transport.
+	if got := tcpRoundTrip(t, addr, "two"); got != "A:two" {
+		t.Fatalf("after failed v2 = %q, want A:two (old runtime restored)", got)
+	}
+
+	// v3: tcp again, target B — applies over the restored runtime.
+	mp.setDoc(3, doc(mkRule("tcp", echoPortB)))
+	m.syncOnce(ctx)
+	ack = mp.lastAck()
+	if ack == nil || ack["applied"] != true || int(ack["version"].(float64)) != 3 {
+		t.Fatalf("v3 ack = %v, want applied v3", ack)
+	}
+	if got := tcpRoundTrip(t, addr, "three"); got != "B:three" {
+		t.Fatalf("v3 echo = %q, want B:three", got)
+	}
+}
+
 // ─── the end-to-end test ─────────────────────────────────────────────
 
 func TestManagerEndToEnd(t *testing.T) {

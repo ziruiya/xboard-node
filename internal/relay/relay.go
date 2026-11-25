@@ -190,6 +190,7 @@ type Manager struct {
 
 	mu             sync.Mutex
 	gostInitOnce   sync.Once
+	genCounter     atomic.Int64 // R04: per-start generation, suffixes gost component names
 	state          *diskState
 	running        map[string]*ruleRuntime
 	zombies        map[string][]*ruleRuntime // closed services still draining; folded once idle
@@ -350,6 +351,22 @@ func (m *Manager) ackLocked(version int, hash string, applied bool, errText stri
 
 // apply brings the running ruleset to the document's state. The lock is
 // released during the drain wait so traffic accounting keeps flowing.
+//
+// GPT review R04 (apply atomicity): the previous implementation closed
+// every changed rule BEFORE starting any replacement, so a single start
+// failure (port conflict, FD stop line) took the old, working rules
+// down with it — and the FD check itself sat inside the start phase,
+// after the closes. The phased version below never lets a failed apply
+// reduce service:
+//   0. the FD admission check runs before anything is closed;
+//   1. fresh rules start first — a failure aborts with all old rules
+//      still serving;
+//   2. changed rules swap make-before-break when the new spec's listen
+//      sockets are disjoint from the old one's; when they overlap
+//      (the common retarget case), the old runtime is closed first and
+//      AUTOMATICALLY RESTORED from its spec if the new start fails;
+//   3. removed rules close last, so a mid-apply failure never removes
+//      service the document still wants gone only on success.
 func (m *Manager) apply(ctx context.Context, doc *panel.RelayDocument) error {
 	draining := !doc.RelayEnabled || doc.MachineStatus == "DRAINING"
 	desired := make(map[string]panel.RelayRule)
@@ -360,41 +377,148 @@ func (m *Manager) apply(ctx context.Context, doc *panel.RelayDocument) error {
 	}
 
 	m.mu.Lock()
-	var stopped []*ruleRuntime
+
+	// Phase 0/1: classify without mutating anything.
+	type swap struct {
+		old  *ruleRuntime
+		spec panel.RelayRule
+	}
+	var swaps []swap
+	var fresh []panel.RelayRule
+	var removed []*ruleRuntime
 	for code, rt := range m.running {
 		want, ok := desired[code]
-		if ok && rt.healthy() && reflect.DeepEqual(rt.spec, want) {
-			continue
-		}
-		if ok && !rt.healthy() && crashBackoffExceeded(rt) {
+		switch {
+		case !ok:
+			removed = append(removed, rt)
+		case rt.healthy() && reflect.DeepEqual(rt.spec, want):
+			// Already serving exactly this spec: keep.
+		case !rt.healthy() && crashBackoffExceeded(rt):
 			// Crashed repeatedly: leave it down (already reported as
 			// suspect via the failed ack at crash time) instead of
 			// flapping the listener every poll.
 			nlog.Core().Error("relay rule restart backoff", "rule", code)
-			continue
+		default:
+			swaps = append(swaps, swap{old: rt, spec: want})
 		}
-		m.closeRuntimeLocked(rt)
-		stopped = append(stopped, rt)
-		delete(m.running, code)
 	}
-	var toStart []panel.RelayRule
 	for code, want := range desired {
 		if _, ok := m.running[code]; !ok {
-			toStart = append(toStart, want)
+			fresh = append(fresh, want)
 		}
 	}
-	sort.Slice(toStart, func(i, j int) bool { return toStart[i].RuleCode < toStart[j].RuleCode })
-	var startErr error
-	if len(toStart) > 0 {
-		startErr = m.startRulesLocked(toStart)
-	}
-	m.mu.Unlock()
-	if startErr != nil {
-		return startErr
+	sort.Slice(fresh, func(i, j int) bool { return fresh[i].RuleCode < fresh[j].RuleCode })
+	sort.Slice(swaps, func(i, j int) bool { return swaps[i].spec.RuleCode < swaps[j].spec.RuleCode })
+
+	// The FD admission check gates ALL start work and runs before the
+	// first close (R04: it previously ran after the closes).
+	if len(fresh) > 0 || len(swaps) > 0 {
+		if err := checkFDAdmission(); err != nil {
+			m.mu.Unlock()
+			return err
+		}
 	}
 
-	if draining && len(stopped) > 0 {
-		m.waitDrain(ctx, stopped)
+	// Phase 1: fresh rules. Nothing has been closed yet; a failure
+	// leaves the entire old ruleset serving.
+	for _, spec := range fresh {
+		if err := m.startOneLocked(spec); err != nil {
+			m.mu.Unlock()
+			return err
+		}
+	}
+
+	// Phase 2: swaps.
+	for _, sw := range swaps {
+		code := sw.spec.RuleCode
+		if !socketsOverlap(sw.old.spec, sw.spec) {
+			// Make-before-break: the new runtime binds disjoint
+			// sockets, so it can prove itself before the old one is
+			// closed. A start failure leaves the old rule serving.
+			if err := m.startOneLocked(sw.spec); err != nil {
+				m.mu.Unlock()
+				return err
+			}
+			m.closeRuntimeLocked(sw.old)
+			continue
+		}
+		// Overlapping sockets (same listen port — the retarget case):
+		// the old listener must close before the new one can bind. If
+		// the new start fails, restore the old runtime from its spec
+		// so the rule keeps serving its previous target.
+		m.closeRuntimeLocked(sw.old)
+		delete(m.running, code)
+		if err := m.startOneLocked(sw.spec); err != nil {
+			if rerr := m.restoreLocked(sw.old); rerr != nil {
+				nlog.Core().Error("relay rule restore after failed swap failed",
+					"rule", code, "start_error", err, "restore_error", rerr)
+			} else {
+				nlog.Core().Warn("relay rule swap failed, old runtime restored", "rule", code, "error", err)
+			}
+			m.mu.Unlock()
+			return err
+		}
+	}
+
+	// Phase 3: removals close last.
+	for _, rt := range removed {
+		m.closeRuntimeLocked(rt)
+		delete(m.running, rt.spec.RuleCode)
+	}
+	m.mu.Unlock()
+
+	if draining && len(removed) > 0 {
+		m.waitDrain(ctx, removed)
+	}
+	return nil
+}
+
+// specTransports returns the transport set a rule spec listens on.
+func specTransports(spec panel.RelayRule) map[string]bool {
+	switch strings.ToLower(spec.Transport) {
+	case "tcp":
+		return map[string]bool{"tcp": true}
+	case "udp":
+		return map[string]bool{"udp": true}
+	default:
+		return map[string]bool{"tcp": true, "udp": true}
+	}
+}
+
+func isWildcardIP(ip string) bool {
+	return ip == "" || ip == "0.0.0.0" || ip == "::"
+}
+
+// socketsOverlap reports whether two specs for the same rule would bind
+// any common (transport, ip, port) socket — the condition under which
+// make-before-break is impossible.
+func socketsOverlap(a, b panel.RelayRule) bool {
+	if a.ListenPort != b.ListenPort {
+		return false
+	}
+	if a.ListenIP != b.ListenIP && !isWildcardIP(a.ListenIP) && !isWildcardIP(b.ListenIP) {
+		return false
+	}
+	ta, tb := specTransports(a), specTransports(b)
+	for tr := range ta {
+		if tb[tr] {
+			return true
+		}
+	}
+	return false
+}
+
+// checkFDAdmission is the pre-flight resource gate for starting new
+// services (R04: hoisted out of the start path so it runs before any
+// existing service is closed).
+func checkFDAdmission() error {
+	if ratio, err := fdUsage(); err == nil {
+		if ratio >= fdStopRatio {
+			return fmt.Errorf("fd usage %.0f%% >= %.0f%% stop line, refusing new relay services", ratio*100, fdStopRatio*100)
+		}
+		if ratio >= fdWarnRatio {
+			nlog.Core().Warn("relay fd usage high", "usage", fmt.Sprintf("%.0f%%", ratio*100))
+		}
 	}
 	return nil
 }
@@ -480,42 +604,61 @@ func (m *Manager) ensureGostInit() {
 	})
 }
 
-// startRulesLocked builds and starts gost services for the given rules,
-// one rule at a time through the config parser. Services are held
+// startOneLocked builds and starts one rule's gost services through
+// the config parser and verifies they actually serve. Services are held
 // directly by the manager and never registered in the global service
 // registry: loader.Load's group replacement closes every previously
 // registered service, which would kill unrelated rules on any change
-// (found in the HK2 pilot, 2026-11-25). Caller holds m.mu.
-func (m *Manager) startRulesLocked(specs []panel.RelayRule) error {
+// (found in the HK2 pilot, 2026-11-25).
+//
+// R04: on ANY failure the half-started runtime is torn down completely
+// (services closed, components unregistered, running entry removed) —
+// the previous batch starter left a failed rule sitting in m.running,
+// where later syncs mistook it for a live one. Caller holds m.mu.
+func (m *Manager) startOneLocked(spec panel.RelayRule) error {
 	m.ensureGostInit()
-	if ratio, err := fdUsage(); err == nil {
-		if ratio >= fdStopRatio {
-			return fmt.Errorf("fd usage %.0f%% >= %.0f%% stop line, refusing new relay services", ratio*100, fdStopRatio*100)
-		}
-		if ratio >= fdWarnRatio {
-			nlog.Core().Warn("relay fd usage high", "usage", fmt.Sprintf("%.0f%%", ratio*100))
-		}
+	gen := m.genCounter.Add(1)
+	rt, err := m.buildRule(spec, gen)
+	if err != nil {
+		return err
 	}
-
-	var started []*ruleRuntime
-	for _, spec := range specs {
-		rt, err := m.buildRule(spec)
-		if err != nil {
-			return err
-		}
-		m.running[spec.RuleCode] = rt
-		started = append(started, rt)
-		for _, ref := range rt.services {
-			go m.serveRule(rt, ref)
-		}
+	m.running[spec.RuleCode] = rt
+	for _, ref := range rt.services {
+		go m.serveRule(rt, ref)
 	}
 	// Surface immediate serve failures (bind races etc.) to the ack.
 	time.Sleep(250 * time.Millisecond)
-	for _, rt := range started {
-		for _, ref := range rt.services {
-			if v := ref.err.Load(); v != nil {
-				return fmt.Errorf("rule %s service %s: %s", rt.spec.RuleCode, ref.name, v.(string))
-			}
+	for _, ref := range rt.services {
+		if v := ref.err.Load(); v != nil {
+			m.closeRuntimeLocked(rt)
+			delete(m.running, spec.RuleCode)
+			return fmt.Errorf("rule %s service %s: %s", spec.RuleCode, ref.name, v.(string))
+		}
+	}
+	return nil
+}
+
+// restoreLocked restarts a previously closed runtime from its spec
+// after a failed overlapping swap (R04). The restored runtime inherits
+// the old one's crash-restart history so backoff accounting survives
+// the swap attempt. Caller holds m.mu.
+func (m *Manager) restoreLocked(old *ruleRuntime) error {
+	gen := m.genCounter.Add(1)
+	rt, err := m.buildRule(old.spec, gen)
+	if err != nil {
+		return err
+	}
+	rt.restarts = old.restarts
+	m.running[old.spec.RuleCode] = rt
+	for _, ref := range rt.services {
+		go m.serveRule(rt, ref)
+	}
+	time.Sleep(250 * time.Millisecond)
+	for _, ref := range rt.services {
+		if v := ref.err.Load(); v != nil {
+			m.closeRuntimeLocked(rt)
+			delete(m.running, old.spec.RuleCode)
+			return fmt.Errorf("restore rule %s service %s: %s", old.spec.RuleCode, ref.name, v.(string))
 		}
 	}
 	return nil
@@ -523,7 +666,13 @@ func (m *Manager) startRulesLocked(specs []panel.RelayRule) error {
 
 // buildRule parses one rule's gost services and registers its named
 // components. On error everything it created is torn down again.
-func (m *Manager) buildRule(spec panel.RelayRule) (rt *ruleRuntime, err error) {
+//
+// The generation suffix (R04) keeps a replacement runtime's gost
+// component names distinct from the still-running old runtime's, which
+// is what makes make-before-break swaps possible at all: the global
+// registries reject duplicate names, so an unsuffixed rebuild could
+// never start while its predecessor lived.
+func (m *Manager) buildRule(spec panel.RelayRule, gen int64) (rt *ruleRuntime, err error) {
 	rt = &ruleRuntime{spec: spec}
 	defer func() {
 		if err != nil {
@@ -556,7 +705,7 @@ func (m *Manager) buildRule(spec panel.RelayRule) (rt *ruleRuntime, err error) {
 	}
 
 	for _, tr := range transports {
-		name := "relay-" + strings.ToLower(spec.RuleCode) + "-" + tr
+		name := fmt.Sprintf("relay-%s-%s-g%d", strings.ToLower(spec.RuleCode), tr, gen)
 		svcCfg := &xconfig.ServiceConfig{
 			Name:     name,
 			Addr:     net.JoinHostPort(spec.ListenIP, strconv.Itoa(spec.ListenPort)),
