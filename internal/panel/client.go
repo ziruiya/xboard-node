@@ -106,11 +106,31 @@ func (c *Client) Handshake() (*HandshakeResponse, error) {
 // The optional metrics map allows the node to submit richer telemetry
 // (active connections, per-core CPU, GC stats, limiter hits, etc.)
 // without changing the core schema of status.
+// TrafficBatchMeta mirrors controlplane.TrafficBatchMeta (kept local
+// to avoid an import cycle).
+type TrafficBatchMeta struct {
+	BatchID       string
+	CollectedFrom int64
+	CollectedTo   int64
+}
+
 func (c *Client) Report(traffic map[int][2]int64, alive map[int][]string, online map[int]int,
 	cpu float64, mem, swap, disk [2]uint64,
 	metrics map[string]interface{},
+	batch *TrafficBatchMeta,
 ) error {
 	payload := make(map[string]interface{})
+
+	// SB-TA-001/002/004: batch envelope. Panels that predate the
+	// protocol ignore this field and dedup the traffic map by content
+	// hash exactly as before.
+	if batch != nil && len(traffic) > 0 {
+		payload["traffic_batch"] = map[string]interface{}{
+			"batch_id":       batch.BatchID,
+			"collected_from": batch.CollectedFrom,
+			"collected_to":   batch.CollectedTo,
+		}
+	}
 
 	if len(traffic) > 0 {
 		t := trafficMapPool.Get().(map[string][2]int64)

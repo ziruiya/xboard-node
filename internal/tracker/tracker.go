@@ -1,14 +1,34 @@
 package tracker
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
+
+// Batch is one sampling window of per-user traffic deltas carrying a
+// persistent, unique batch ID (SB-TA-001/002, agent side).
+//
+// Protocol: a batch is flushed once with its ID; until the panel
+// acknowledges it (the report call succeeds), the SAME batch — same
+// ID, same content — is re-sent verbatim. New traffic sampled in the
+// meantime accumulates into the next batch and is never merged into
+// an unacknowledged one. The panel dedups on (node, batch ID), so a
+// retry cannot double-count old deltas (001) and two independent
+// samples with identical content still count separately (002).
+type Batch struct {
+	ID            string
+	CollectedFrom int64 // unix seconds: first delta of the window
+	CollectedTo   int64 // unix seconds: flush time
+	Data          map[int][2]int64
+}
 
 // snapshot is an immutable point-in-time view of tracker state.
 // It is swapped atomically so readers never block writers.
@@ -45,6 +65,21 @@ type Tracker struct {
 	// Protected by mu — written by Process, drained by FlushTraffic.
 	pendingTraffic map[int][2]int64
 
+	// pendingFrom is the unix time the first delta of the current
+	// pending window landed (SB-TA-004 collection window).
+	// Protected by mu.
+	pendingFrom int64
+
+	// unacked is the last flushed batch that the panel has not yet
+	// acknowledged. It is re-sent verbatim and never merged with new
+	// samples. Protected by mu.
+	unacked *Batch
+
+	// batchSeq disambiguates batch IDs generated in the same process;
+	// idPrefix is a per-process random component. Protected by mu.
+	batchSeq uint64
+	idPrefix string
+
 	// live holds the current snapshot, swapped atomically.
 	// Readers load this pointer without any lock.
 	live atomic.Pointer[snapshot]
@@ -58,10 +93,16 @@ type Tracker struct {
 }
 
 func New() *Tracker {
+	var rb [8]byte
+	idPrefix := fmt.Sprintf("%d", time.Now().UnixNano())
+	if _, err := rand.Read(rb[:]); err == nil {
+		idPrefix = hex.EncodeToString(rb[:])
+	}
 	t := &Tracker{
 		lastSeen:       make(map[int][2]int64),
 		pendingTraffic: make(map[int][2]int64),
 		aliveIPsBuf:    make(map[int][]string),
+		idPrefix:       idPrefix,
 	}
 	// Publish initial empty snapshot.
 	t.live.Store(&snapshot{
@@ -103,6 +144,9 @@ func (t *Tracker) Process(
 		t.lastSeen[uid] = cum
 
 		if deltaUp > 0 || deltaDown > 0 {
+			if len(t.pendingTraffic) == 0 && t.pendingFrom == 0 {
+				t.pendingFrom = time.Now().Unix()
+			}
 			cur := t.pendingTraffic[uid]
 			cur[0] += deltaUp
 			cur[1] += deltaDown
@@ -136,8 +180,62 @@ func (t *Tracker) FlushTraffic() map[int][2]int64 {
 	t.mu.Lock()
 	data := t.pendingTraffic
 	t.pendingTraffic = make(map[int][2]int64, len(data))
+	t.pendingFrom = 0
 	t.mu.Unlock()
 	return data
+}
+
+// FlushBatch drains the pending window into a new Batch with a fresh
+// persistent ID (SB-TA-001/002). Returns nil when nothing accumulated.
+// The caller is expected to SetUnacked the batch and re-send it
+// verbatim until the panel acknowledges it.
+func (t *Tracker) FlushBatch() *Batch {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.pendingTraffic) == 0 {
+		return nil
+	}
+	data := t.pendingTraffic
+	t.pendingTraffic = make(map[int][2]int64, len(data))
+	from := t.pendingFrom
+	t.pendingFrom = 0
+	if from == 0 {
+		from = time.Now().Unix()
+	}
+	t.batchSeq++
+	return &Batch{
+		ID:            fmt.Sprintf("%s-%d", t.idPrefix, t.batchSeq),
+		CollectedFrom: from,
+		CollectedTo:   time.Now().Unix(),
+		Data:          data,
+	}
+}
+
+// SetUnacked records the batch awaiting panel acknowledgement.
+func (t *Tracker) SetUnacked(b *Batch) {
+	t.mu.Lock()
+	t.unacked = b
+	t.mu.Unlock()
+}
+
+// Unacked returns the batch awaiting acknowledgement, or nil.
+func (t *Tracker) Unacked() *Batch {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.unacked
+}
+
+// AckBatch clears the unacknowledged batch when the panel confirmed
+// receipt of exactly that batch. Returns false when the IDs differ
+// (a newer batch is already in flight).
+func (t *Tracker) AckBatch(id string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.unacked != nil && t.unacked.ID == id {
+		t.unacked = nil
+		return true
+	}
+	return false
 }
 
 // RestoreTraffic adds traffic back (used when push to panel fails).

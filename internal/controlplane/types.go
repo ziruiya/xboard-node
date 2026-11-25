@@ -48,15 +48,27 @@ type Snapshot struct {
 	Users  []model.UserSpec
 }
 
+// TrafficBatchMeta is the report envelope of the persistent batch-id
+// protocol (SB-TA-001/002/004). Nil for reports without traffic.
+type TrafficBatchMeta struct {
+	BatchID       string
+	CollectedFrom int64
+	CollectedTo   int64
+}
+
 type ReportPayload struct {
 	Traffic map[int][2]int64
-	Alive   map[int][]string
-	Online  map[int]int
-	CPU     float64
-	Mem     [2]uint64
-	Swap    [2]uint64
-	Disk    [2]uint64
-	Metrics map[string]interface{}
+	// TrafficBatch describes Traffic: the batch id and the collection
+	// window. Old panels ignore the envelope and keep using the
+	// content-hash fallback on Traffic itself.
+	TrafficBatch *TrafficBatchMeta
+	Alive        map[int][]string
+	Online       map[int]int
+	CPU          float64
+	Mem          [2]uint64
+	Swap         [2]uint64
+	Disk         [2]uint64
+	Metrics      map[string]interface{}
 }
 
 type PushClient interface {

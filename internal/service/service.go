@@ -975,7 +975,25 @@ func (s *Service) pushReportAsync() {
 		return
 	}
 
-	traffic := s.tracker.FlushTraffic()
+	// SB-TA-001/002: an unacknowledged batch is re-sent verbatim
+	// (same ID, same content); new samples keep accumulating into the
+	// next batch and are never merged into it. Only when no batch is
+	// outstanding do we flush a fresh one.
+	batch := s.tracker.Unacked()
+	if batch == nil {
+		batch = s.tracker.FlushBatch()
+		if batch != nil {
+			s.tracker.SetUnacked(batch)
+		}
+	}
+	var traffic map[int][2]int64
+	var batchMeta *controlplane.TrafficBatchMeta
+	if batch != nil {
+		traffic = batch.Data
+		batchMeta = &controlplane.TrafficBatchMeta{BatchID: batch.ID, CollectedFrom: batch.CollectedFrom, CollectedTo: batch.CollectedTo}
+	} else {
+		traffic = make(map[int][2]int64)
+	}
 	aliveIPs := s.tracker.FlushAliveIPs()
 	online := s.tracker.CurrentOnline()
 	status := monitor.Collect()
@@ -984,16 +1002,19 @@ func (s *Service) pushReportAsync() {
 
 	go func() {
 		defer s.pushActive.Store(false)
-		if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
+		if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, TrafficBatch: batchMeta, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
 			nlog.Core().Warn("failed to push report", "error", err)
-			if len(traffic) > 0 {
-				s.tracker.RestoreTraffic(traffic)
-			}
+			// The batch stays unacknowledged and will be re-sent
+			// verbatim on the next push; do NOT merge it back into
+			// the pending accumulator (that was the TA-001 defect).
 			if len(aliveIPs) > 0 {
 				s.tracker.RestoreAliveIPs(aliveIPs)
 			}
 			s.pushBackoff.onFailure()
 			return
+		}
+		if batch != nil {
+			s.tracker.AckBatch(batch.ID)
 		}
 		s.pushBackoff.onSuccess()
 		nlog.ReportPushed(len(traffic), len(online))
@@ -1005,15 +1026,35 @@ func (s *Service) pushReportSync() {
 	if !s.sink.SupportsReporting() {
 		return
 	}
-	traffic := s.tracker.FlushTraffic()
+	// Same batch discipline as the async path: an outstanding batch is
+	// re-sent verbatim; otherwise flush whatever is still pending.
+	batch := s.tracker.Unacked()
+	if batch == nil {
+		batch = s.tracker.FlushBatch()
+		if batch != nil {
+			s.tracker.SetUnacked(batch)
+		}
+	}
+	var traffic map[int][2]int64
+	var batchMeta *controlplane.TrafficBatchMeta
+	if batch != nil {
+		traffic = batch.Data
+		batchMeta = &controlplane.TrafficBatchMeta{BatchID: batch.ID, CollectedFrom: batch.CollectedFrom, CollectedTo: batch.CollectedTo}
+	} else {
+		traffic = make(map[int][2]int64)
+	}
 	aliveIPs := s.tracker.FlushAliveIPs()
 	online := s.tracker.CurrentOnline()
 	status := monitor.Collect()
 	metrics := s.buildMetrics(status)
 	metrics["kernel_status"] = s.kernel.IsRunning()
 
-	if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
+	if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, TrafficBatch: batchMeta, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
 		nlog.Core().Warn("failed to push final report", "error", err)
+		return
+	}
+	if batch != nil {
+		s.tracker.AckBatch(batch.ID)
 	}
 }
 
