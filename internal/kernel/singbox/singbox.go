@@ -34,7 +34,10 @@ const drainTimeout = 5 * time.Second
 // UpdatableInbound interface, which hot-swaps user credentials without
 // restarting listeners — zero connection disruption.
 type SingBox struct {
-	cfg config.KernelConfig
+	cfg       config.KernelConfig
+	outbounds []byte // serialized outbound configuration of the running instance
+
+	platform adapter.PlatformInterface
 
 	mu     sync.RWMutex
 	box    *box.Box
@@ -93,16 +96,27 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cfgMap := buildConfig(s.cfg, nodeConfig, users, tls)
+	return s.startLocked(nodeConfig, users, tls, buildConfig(s.cfg, nodeConfig, users, tls))
+}
+
+func (s *SingBox) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert, cfgMap M) error {
 	data, err := json.Marshal(cfgMap)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
+	}
+
+	outbounds, err := json.Marshal(cfgMap["outbounds"])
+	if err != nil {
+		return fmt.Errorf("marshal outbounds: %w", err)
 	}
 
 	nlog.Core().Debug("sing-box config generated", "len", len(data))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx = include.Context(ctx)
+	if s.platform != nil {
+		ctx = service.ContextWith[adapter.PlatformInterface](ctx, s.platform)
+	}
 
 	opts, err := singJSON.UnmarshalExtendedContext[option.Options](ctx, data)
 	if err != nil {
@@ -133,6 +147,7 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 
 	// New instance started successfully — swap state.
 	s.box = instance
+	s.outbounds = outbounds
 	s.ctx = ctx
 	s.cancel = cancel
 	s.users = users
@@ -189,9 +204,8 @@ func recycleOldBox(oldBox *box.Box, oldCancel context.CancelFunc, oldCtx context
 	nlog.Core().Debug("sing-box: old instance recycled")
 }
 
-// Reload hot-swaps the inbound users and routing rules without restarting the box.
-// Routes, outbounds, and the connTracker stay alive so in-flight connections
-// continue to be tracked correctly.
+// Reload updates routing and inbounds in place when outbounds are unchanged.
+// An outbound change requires a replacement instance.
 func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -201,6 +215,13 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 	}
 
 	cfgMap := buildConfig(s.cfg, nodeConfig, users, tls)
+	outbounds, err := json.Marshal(cfgMap["outbounds"])
+	if err != nil {
+		return fmt.Errorf("marshal outbounds: %w", err)
+	}
+	if !bytes.Equal(s.outbounds, outbounds) {
+		return s.startLocked(nodeConfig, users, tls, cfgMap)
+	}
 	data, err := json.Marshal(cfgMap)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
@@ -223,10 +244,9 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 
 	// Update routing rules
 	if err := router.UpdateRules(opts.Route.Rules, opts.Route.RuleSet); err != nil {
-		nlog.Core().Debug("routing reload failed", "error", err)
-	} else {
-		nlog.Core().Debug("sing-box routing reloaded")
+		return fmt.Errorf("reload sing-box routing: %w", err)
 	}
+	nlog.Core().Debug("sing-box routing reloaded")
 
 	nopFactory := singLog.NewNOPFactory()
 

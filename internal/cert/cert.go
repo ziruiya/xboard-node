@@ -54,11 +54,12 @@ type Manager struct {
 	// Atomic so the ACME renewal goroutine can swap without racing readers.
 	mat atomic.Pointer[certMaterial]
 
-	magic           *certmagic.Config
-	renewed         atomic.Bool
-	acmeStarted     bool
-	acmeFingerprint string
-	acmeCancel      context.CancelFunc
+	magic            *certmagic.Config
+	renewalVersion   atomic.Uint64
+	confirmedRenewal uint64 // accessed by the service loop
+	acmeStarted      bool
+	acmeFingerprint  string
+	acmeCancel       context.CancelFunc
 }
 
 // certMaterial is an immutable snapshot of PEM-encoded cert + key.
@@ -246,7 +247,22 @@ func (m *Manager) HasCert() bool {
 	mat := m.mat.Load()
 	return mat != nil && len(mat.certPEM) > 0 && len(mat.keyPEM) > 0
 }
-func (m *Manager) CertRenewed() bool { return m.renewed.Swap(false) }
+
+// PendingRenewal peeks at the newest renewal without consuming it.
+func (m *Manager) PendingRenewal() uint64 {
+	version := m.renewalVersion.Load()
+	if version <= m.confirmedRenewal {
+		return 0
+	}
+	return version
+}
+
+// ConfirmRenewal acknowledges only the version observed before applying PEM.
+func (m *Manager) ConfirmRenewal(version uint64) {
+	if version > m.confirmedRenewal {
+		m.confirmedRenewal = version
+	}
+}
 
 // TLSCert returns the current PEM material as a kernel.TLSCert.
 func (m *Manager) TLSCert() kernel.TLSCert {
@@ -445,7 +461,7 @@ func (m *Manager) startACME(ctx context.Context, dnsSolver *certmagic.DNS01Solve
 				nlog.Core().Error("failed to reload cert after renewal", "error", err)
 				return nil
 			}
-			m.renewed.Store(true)
+			m.renewalVersion.Add(1)
 			nlog.Core().Info("TLS certificate reloaded after renewal", "domain", m.cfg.Domain)
 			return nil
 		},

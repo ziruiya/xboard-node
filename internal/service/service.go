@@ -37,7 +37,7 @@ type Service struct {
 	tracker      *tracker.Tracker
 	limiter      *limiter.Limiter
 	speedTracker *limiter.SpeedTracker
-	cert         *cert.Manager
+	cert         certificateManager
 
 	lastConfig *model.NodeSpec
 	lastUsers  []model.UserSpec
@@ -79,13 +79,22 @@ type Service struct {
 	metricsMu sync.RWMutex
 }
 
+type certificateManager interface {
+	Start(context.Context) error
+	Stop()
+	Reconfigure(context.Context, config.CertConfig) (bool, error)
+	HasCert() bool
+	TLSCert() kernel.TLSCert
+	PendingRenewal() uint64
+	ConfirmRenewal(uint64)
+}
+
 // pullResult carries the outcome of an async pullViaAPI back to the main goroutine.
 type pullResult struct {
-	config      *model.NodeSpec
-	users       []model.UserSpec
-	configHash  string
-	userHash    string
-	certChanged bool
+	config     *model.NodeSpec
+	users      []model.UserSpec
+	configHash string
+	userHash   string
 }
 
 // apiBackoff implements simple exponential backoff for API failures.
@@ -216,12 +225,20 @@ func (s *Service) Run(ctx context.Context) error {
 	defer wsDiscoveryTicker.Stop()
 
 	s.startWSClient(ctx)
+	return s.runEvents(ctx, trackTicker, reportTicker, pullTicker, deviceReportTicker, wsDiscoveryTicker)
+}
 
+func (s *Service) runEvents(ctx context.Context, trackTicker, reportTicker, pullTicker, deviceReportTicker, wsDiscoveryTicker *time.Ticker) error {
+	renewalTicker := time.NewTicker(time.Second)
+	defer renewalTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			s.pushReportSync()
 			return nil
+
+		case <-renewalTicker.C:
+			s.applyCertificateRenewal()
 
 		case <-trackTicker.C:
 			s.trackAndEnforce(ctx)
@@ -624,7 +641,6 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 	}
 
 	currentConfigHash := s.lastConfigHash
-	certChanged := s.cert.CertRenewed()
 
 	go func() {
 		defer s.pullActive.Store(false)
@@ -636,11 +652,11 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 		}
 		s.pullBackoff.onSuccess()
 
-		result := pullResult{certChanged: certChanged}
+		result := pullResult{}
 		if snapshot.Config != nil {
 			result.config = snapshot.Config
 			result.configHash = computeConfigHash(snapshot.Config)
-			if result.configHash == currentConfigHash && !certChanged {
+			if result.configHash == currentConfigHash {
 				result.config = nil
 			}
 		}
@@ -660,11 +676,6 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 	s.wsResyncPending.Store(false)
 	configChanged := false
-
-	if result.certChanged {
-		nlog.Core().Info("certificate renewed, kernel restart needed")
-		configChanged = true
-	}
 
 	if result.config != nil {
 		if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), result.config, s.cert.TLSCert()); err != nil {
@@ -763,14 +774,25 @@ func (s *Service) restoreUserState(users []model.UserSpec, hash string) {
 	s.lastUserHash = hash
 }
 
+func (s *Service) applyCertificateRenewal() {
+	if s.cert.PendingRenewal() != 0 && s.lastConfig != nil && len(s.lastUsers) != 0 {
+		s.startKernel(s.lastConfig, s.lastUsers)
+	}
+}
+
 // startKernel starts (or restarts) the kernel with the given config/users and
 // records the successfully applied state. Returns false on error.
 func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
-	if err := s.kernel.Start(nc, users, s.cert.TLSCert()); err != nil {
+	renewal := s.cert.PendingRenewal()
+	tls := s.cert.TLSCert()
+	if err := s.kernel.Start(nc, users, tls); err != nil {
 		nlog.Core().Error("failed to start kernel", "error", err)
 		return false
 	}
 
+	if renewal != 0 && tls.HasCert() {
+		s.cert.ConfirmRenewal(renewal)
+	}
 	s.appliedState.Config = nc
 	s.appliedState.Users = users
 

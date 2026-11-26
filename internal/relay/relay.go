@@ -41,14 +41,12 @@ import (
 	"github.com/go-gost/x/config/loader"
 	admission_parser "github.com/go-gost/x/config/parsing/admission"
 	limiter_parser "github.com/go-gost/x/config/parsing/limiter"
-	service_parser "github.com/go-gost/x/config/parsing/service"
 	"github.com/go-gost/x/registry"
 	xservice "github.com/go-gost/x/service"
 
 	_ "github.com/go-gost/x/connector/http"
 	_ "github.com/go-gost/x/dialer/tcp"
 	_ "github.com/go-gost/x/dialer/udp"
-	_ "github.com/go-gost/x/handler/forward/local"
 	_ "github.com/go-gost/x/listener/tcp"
 	_ "github.com/go-gost/x/listener/udp"
 
@@ -85,10 +83,10 @@ func (c counters) zero() bool { return c.In == 0 && c.Out == 0 && c.Conns == 0 }
 // diskState is persisted across restarts so traffic batches keep their
 // identity (boot_id is per process; seq and folded totals are durable).
 type diskState struct {
-	NextSeq  map[string]int64            `json:"next_seq"`
-	Banked   map[string]counters         `json:"banked"`
-	Reported map[string]counters         `json:"reported"`
-	Pending  []panel.RelayTrafficBatch   `json:"pending"`
+	NextSeq  map[string]int64          `json:"next_seq"`
+	Banked   map[string]counters       `json:"banked"`
+	Reported map[string]counters       `json:"reported"`
+	Pending  []panel.RelayTrafficBatch `json:"pending"`
 }
 
 func newDiskState() *diskState {
@@ -101,10 +99,11 @@ func newDiskState() *diskState {
 
 // svcRef is one running gost service (one transport of one rule).
 type svcRef struct {
-	name string
-	svc  coreservice.Service
-	err  atomic.Value // string, set when Serve exits unexpectedly
-	done atomic.Bool
+	name     string
+	svc      coreservice.Service
+	err      atomic.Value // string, set when Serve exits unexpectedly
+	done     atomic.Bool
+	finished chan struct{}
 }
 
 // componentRef is a named gost component (limiter / admission) that a
@@ -119,10 +118,14 @@ type componentRef struct {
 // ruleRuntime is one applied rule: one gost service per transport.
 type ruleRuntime struct {
 	spec       panel.RelayRule
+	targetIP   string
+	version    int
+	flows      runtimeFlows
 	services   []*svcRef
 	components []componentRef
 	closed     atomic.Bool
 	restarts   []time.Time // recent restart timestamps (crash backoff)
+	closedAt   time.Time
 }
 
 func (rt *ruleRuntime) healthy() bool {
@@ -181,12 +184,19 @@ func svcCurrentConns(svc coreservice.Service) int64 {
 	return int64(s.Get(corestats.KindCurrentConns))
 }
 
+type relayPanel interface {
+	FetchRelayConfig() (*panel.RelayConfigResponse, error)
+	PostRelayAck(version int, hash string, applied bool, errText string) error
+	PostRelayTraffic([]panel.RelayTrafficBatch) (*panel.RelayTrafficResult, error)
+}
+
 // Manager owns the relay data plane for one machine-mode agent.
 type Manager struct {
-	client    *panel.Client
-	machineID int
-	stateDir  string
-	bootID    string
+	client         relayPanel
+	machineID      int
+	stateDir       string
+	bootID         string
+	interfaceAddrs func() ([]net.Addr, error)
 
 	mu             sync.Mutex
 	flushMu        sync.Mutex // NODE-003: serializes flushTraffic end to end
@@ -213,13 +223,14 @@ func NewManager(client *panel.Client, machineID int, stateDir string) *Manager {
 	var rb [8]byte
 	_, _ = rand.Read(rb[:])
 	return &Manager{
-		client:    client,
-		machineID: machineID,
-		stateDir:  stateDir,
-		bootID:    "b" + hex.EncodeToString(rb[:]),
-		running:   make(map[string]*ruleRuntime),
-		zombies:   make(map[string][]*ruleRuntime),
-		lastFlush: time.Now(),
+		client:         client,
+		interfaceAddrs: net.InterfaceAddrs,
+		machineID:      machineID,
+		stateDir:       stateDir,
+		bootID:         "b" + hex.EncodeToString(rb[:]),
+		running:        make(map[string]*ruleRuntime),
+		zombies:        make(map[string][]*ruleRuntime),
+		lastFlush:      time.Now(),
 	}
 }
 
@@ -238,7 +249,9 @@ func (m *Manager) Run(ctx context.Context) {
 		m.closeRuntimeLocked(rt)
 	}
 	m.running = make(map[string]*ruleRuntime)
+	stopped := m.zombieRuntimesLocked()
 	m.mu.Unlock()
+	m.waitDrain(ctx, stopped)
 	flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	done := make(chan struct{})
@@ -321,7 +334,7 @@ func (m *Manager) syncOnce(ctx context.Context) {
 	}
 	m.mu.Unlock()
 
-	if err := m.apply(ctx, doc); err != nil {
+	if err := m.apply(ctx, doc, hash); err != nil {
 		nlog.Core().Error("relay apply failed", "version", doc.Version, "error", err)
 		m.mu.Lock()
 		m.ackLocked(doc.Version, hash, false, err.Error())
@@ -329,12 +342,6 @@ func (m *Manager) syncOnce(ctx context.Context) {
 		return
 	}
 
-	m.mu.Lock()
-	m.appliedVersion = doc.Version
-	m.appliedHash = hash
-	m.suspectNoted = false
-	m.ackLocked(doc.Version, hash, true, "")
-	m.mu.Unlock()
 	nlog.Core().Info("relay config applied", "version", doc.Version, "rules", len(doc.Rules), "machine_status", doc.MachineStatus)
 }
 
@@ -359,44 +366,51 @@ func (m *Manager) ackLocked(version int, hash string, applied bool, errText stri
 // down with it — and the FD check itself sat inside the start phase,
 // after the closes. The phased version below never lets a failed apply
 // reduce service:
-//   0. the FD admission check runs before anything is closed;
-//   1. fresh rules start first — a failure aborts with all old rules
-//      still serving;
-//   2. changed rules swap make-before-break when the new spec's listen
-//      sockets are disjoint from the old one's; when they overlap
-//      (the common retarget case), the old runtime is closed first and
-//      AUTOMATICALLY RESTORED from its spec if the new start fails;
-//   3. removed rules close last, so a mid-apply failure never removes
-//      service the document still wants gone only on success.
+//  0. the FD admission check runs before anything is closed;
+//  1. fresh rules start first — a failure aborts with all old rules
+//     still serving;
+//  2. changed rules swap make-before-break when the new spec's listen
+//     sockets are disjoint from the old one's; when they overlap
+//     (the common retarget case), the old runtime is closed first and
+//     AUTOMATICALLY RESTORED from its spec if the new start fails;
+//  3. removed rules close last, so a mid-apply failure never removes
+//     service the document still wants gone only on success.
 //
 // GPT round 2, B02 (whole-document atomicity): R04's phases were atomic
 // per RULE, not per DOCUMENT — a multi-rule apply that failed halfway
 // left the rules it had already switched running their NEW specs: a
 // mixed ruleset that is neither the old document nor the new one. The
 // apply below treats the document as one atomic unit:
-//   A. every fresh rule and every disjoint swap is STAGED — built
-//      (sockets bound, bind conflicts proven out) but NOT serving and
-//      NOT registered, without closing anything it will replace; any
-//      failure tears down all staged runtimes and the confirmed
-//      ruleset is untouched (NODE-007: staged runtimes forward
-//      nothing; serving starts only at the commit point below);
-//   B. overlapping swaps (which cannot be staged — the new runtime
-//      cannot bind until the old one closes) run one by one, each
-//      individually restored on failure as in R04; if one fails, the
-//      swaps already completed in this phase are REVERSED back to
-//      their old specs and the staged set is torn down;
-//   C. only when A and B have fully succeeded does the commit register
-//      the staged runtimes, close the disjoint-swap predecessors and
-//      close the removals.
+//
+//	A. every fresh rule and every disjoint swap is STAGED — built
+//	   (sockets bound, bind conflicts proven out) but NOT serving and
+//	   NOT registered, without closing anything it will replace; any
+//	   failure tears down all staged runtimes and the confirmed
+//	   ruleset is untouched (NODE-007: staged runtimes forward
+//	   nothing; serving starts only at the commit point below);
+//	B. overlapping swaps (which cannot be staged — the new runtime
+//	   cannot bind until the old one closes) run one by one, each
+//	   individually restored on failure as in R04; if one fails, the
+//	   swaps already completed in this phase are REVERSED back to
+//	   their old specs and the staged set is torn down;
+//	C. only when A and B have fully succeeded does the commit register
+//	   the staged runtimes, close the disjoint-swap predecessors and
+//	   close the removals.
+//
 // A failed apply therefore leaves the machine serving exactly the last
 // confirmed document, rule for rule.
-func (m *Manager) apply(ctx context.Context, doc *panel.RelayDocument) error {
+func (m *Manager) apply(ctx context.Context, doc *panel.RelayDocument, ackHash ...string) error {
 	draining := !doc.RelayEnabled || doc.MachineStatus == "DRAINING"
 	desired := make(map[string]panel.RelayRule)
 	if !draining {
 		for _, r := range doc.Rules {
 			desired[r.RuleCode] = normalizeRule(r)
 		}
+	}
+
+	targets, err := resolveRelayTargets(ctx, desired, m.interfaceAddrs)
+	if err != nil {
+		return err
 	}
 
 	m.mu.Lock()
@@ -414,7 +428,7 @@ func (m *Manager) apply(ctx context.Context, doc *panel.RelayDocument) error {
 		switch {
 		case !ok:
 			removed = append(removed, rt)
-		case rt.healthy() && reflect.DeepEqual(rt.spec, want):
+		case rt.healthy() && rt.targetIP == targets[code] && reflect.DeepEqual(rt.spec, want):
 			// Already serving exactly this spec: keep.
 		case !rt.healthy() && crashBackoffExceeded(rt):
 			// Crashed repeatedly: leave it down (already reported as
@@ -462,7 +476,7 @@ func (m *Manager) apply(ctx context.Context, doc *panel.RelayDocument) error {
 		}
 	}
 	for _, spec := range fresh {
-		rt, err := m.buildRuntimeLocked(spec)
+		rt, err := m.buildRuntimeLocked(spec, targets[spec.RuleCode])
 		if err != nil {
 			teardownStaged()
 			m.mu.Unlock()
@@ -477,7 +491,7 @@ func (m *Manager) apply(ctx context.Context, doc *panel.RelayDocument) error {
 		// Make-before-break: the new runtime binds disjoint sockets, so
 		// it can prove its sockets while the old one keeps serving. It
 		// does not forward yet (NODE-007) — serving starts at commit.
-		rt, err := m.buildRuntimeLocked(sw.spec)
+		rt, err := m.buildRuntimeLocked(sw.spec, targets[sw.spec.RuleCode])
 		if err != nil {
 			teardownStaged()
 			m.mu.Unlock()
@@ -514,7 +528,7 @@ func (m *Manager) apply(ctx context.Context, doc *panel.RelayDocument) error {
 		code := sw.spec.RuleCode
 		m.closeRuntimeLocked(sw.old)
 		delete(m.running, code)
-		if err := m.startOneLocked(sw.spec); err != nil {
+		if err := m.startOneLocked(sw.spec, targets[code]); err != nil {
 			if rerr := m.restoreLocked(sw.old); rerr != nil {
 				nlog.Core().Error("relay rule restore after failed swap failed",
 					"rule", code, "start_error", err, "restore_error", rerr)
@@ -546,6 +560,21 @@ func (m *Manager) apply(ctx context.Context, doc *panel.RelayDocument) error {
 				return err
 			}
 		}
+		for _, rt := range stagedFresh {
+			if err := rt.serveError(); err != nil {
+				return err
+			}
+		}
+		for _, staged := range stagedDisjoint {
+			if err := staged.rt.serveError(); err != nil {
+				return err
+			}
+		}
+		for _, sw := range doneOverlap {
+			if err := m.running[sw.spec.RuleCode].serveError(); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 	if err := serveStaged(); err != nil {
@@ -568,11 +597,22 @@ func (m *Manager) apply(ctx context.Context, doc *panel.RelayDocument) error {
 		m.closeRuntimeLocked(rt)
 		delete(m.running, rt.spec.RuleCode)
 	}
-	m.mu.Unlock()
-
-	if draining && len(removed) > 0 {
-		m.waitDrain(ctx, removed)
+	if draining {
+		stopped := m.zombieRuntimesLocked()
+		m.mu.Unlock()
+		m.waitDrain(ctx, stopped)
+		m.mu.Lock()
 	}
+	if len(ackHash) != 0 {
+		for _, rt := range m.running {
+			rt.version = doc.Version
+		}
+		m.appliedVersion = doc.Version
+		m.appliedHash = ackHash[0]
+		m.suspectNoted = false
+		m.ackLocked(doc.Version, m.appliedHash, true, "")
+	}
+	m.mu.Unlock()
 	return nil
 }
 
@@ -626,41 +666,50 @@ func checkFDAdmission() error {
 	return nil
 }
 
-// waitDrain waits for stopped rules' connections to empty, bounded by
-// the longest drain window among them (design: UDP gets no lossless
-// promise — idle sessions end by TTL, anything left at the deadline is
-// force-cleaned by abandonment and the bytes stay accounted through the
-// zombie fold).
+// waitDrain lets each stopped runtime finish at its own deadline, then
+// joins its forwarding handlers and folds their final counters.
 func (m *Manager) waitDrain(ctx context.Context, stopped []*ruleRuntime) {
-	maxDrain := 0
+	var drains sync.WaitGroup
 	for _, rt := range stopped {
-		if rt.spec.DrainTimeoutSec > maxDrain {
-			maxDrain = rt.spec.DrainTimeoutSec
-		}
+		drains.Go(func() {
+			timeout := rt.spec.DrainTimeoutSec
+			if timeout <= 0 {
+				timeout = 300
+			}
+			deadline, cancel := context.WithDeadline(ctx, rt.closedAt.Add(time.Duration(timeout)*time.Second))
+			defer cancel()
+			tick := time.NewTicker(50 * time.Millisecond)
+			defer tick.Stop()
+			for rt.currentConns() != 0 || !rt.flows.idle() {
+				select {
+				case <-tick.C:
+					continue
+				case <-deadline.Done():
+					nlog.Core().Warn("relay forcing connection cleanup", "rule", rt.spec.RuleCode, "open_conns", rt.currentConns())
+				}
+				break
+			}
+			rt.flows.terminate()
+			// Serve joins its accept loop and any late handler calls.
+			for _, ref := range rt.services {
+				if ref.finished != nil {
+					<-ref.finished
+				}
+			}
+			m.mu.Lock()
+			m.foldZombiesLocked()
+			m.mu.Unlock()
+		})
 	}
-	if maxDrain <= 0 {
-		maxDrain = 300
+	drains.Wait()
+}
+
+func (m *Manager) zombieRuntimesLocked() []*ruleRuntime {
+	var stopped []*ruleRuntime
+	for _, list := range m.zombies {
+		stopped = append(stopped, list...)
 	}
-	deadline := time.Now().Add(time.Duration(maxDrain) * time.Second)
-	for {
-		remaining := int64(0)
-		for _, rt := range stopped {
-			remaining += rt.currentConns()
-		}
-		if remaining == 0 {
-			nlog.Core().Info("relay drain complete", "rules", len(stopped))
-			return
-		}
-		if time.Now().After(deadline) {
-			nlog.Core().Warn("relay drain deadline reached, forcing cleanup", "rules", len(stopped), "open_conns", remaining)
-			return
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(500 * time.Millisecond):
-		}
-	}
+	return stopped
 }
 
 // closeRuntimeLocked closes a rule's services (listeners stop accepting
@@ -671,6 +720,7 @@ func (m *Manager) closeRuntimeLocked(rt *ruleRuntime) {
 	if rt.closed.Load() {
 		return
 	}
+	rt.closedAt = time.Now()
 	rt.closed.Store(true)
 	for _, ref := range rt.services {
 		if err := ref.svc.Close(); err != nil {
@@ -726,10 +776,14 @@ func (m *Manager) ensureGostInit() {
 // R04: on ANY failure the half-built runtime is torn down completely
 // (services closed, components unregistered) before the error returns.
 // Caller holds m.mu.
-func (m *Manager) buildRuntimeLocked(spec panel.RelayRule) (*ruleRuntime, error) {
+func (m *Manager) buildRuntimeLocked(spec panel.RelayRule, pinnedIP ...string) (*ruleRuntime, error) {
 	m.ensureGostInit()
 	gen := m.genCounter.Add(1)
-	return m.buildRule(spec, gen)
+	targetIP := spec.TargetHost
+	if len(pinnedIP) != 0 {
+		targetIP = pinnedIP[0]
+	}
+	return m.buildRule(spec, gen, targetIP)
 }
 
 // serveRuntimeLocked starts a built runtime's services and verifies
@@ -738,13 +792,24 @@ func (m *Manager) buildRuntimeLocked(spec panel.RelayRule) (*ruleRuntime, error)
 // Caller holds m.mu.
 func (m *Manager) serveRuntimeLocked(rt *ruleRuntime) error {
 	for _, ref := range rt.services {
-		go m.serveRule(rt, ref)
+		ref.finished = make(chan struct{})
+		go func() {
+			defer close(ref.finished)
+			m.serveRule(rt, ref)
+		}()
 	}
 	// Surface immediate serve failures (bind races etc.) to the ack.
 	time.Sleep(250 * time.Millisecond)
+	if err := rt.serveError(); err != nil {
+		m.closeRuntimeLocked(rt)
+		return err
+	}
+	return nil
+}
+
+func (rt *ruleRuntime) serveError() error {
 	for _, ref := range rt.services {
 		if v := ref.err.Load(); v != nil {
-			m.closeRuntimeLocked(rt)
 			return fmt.Errorf("rule %s service %s: %s", rt.spec.RuleCode, ref.name, v.(string))
 		}
 	}
@@ -755,8 +820,8 @@ func (m *Manager) serveRuntimeLocked(rt *ruleRuntime) error {
 // (stage-B overlapping swaps and restores, where the predecessor is
 // already closed and delay would only extend the outage). Caller
 // holds m.mu.
-func (m *Manager) startRuntimeLocked(spec panel.RelayRule) (*ruleRuntime, error) {
-	rt, err := m.buildRuntimeLocked(spec)
+func (m *Manager) startRuntimeLocked(spec panel.RelayRule, targetIP string) (*ruleRuntime, error) {
+	rt, err := m.buildRuntimeLocked(spec, targetIP)
 	if err != nil {
 		return nil, err
 	}
@@ -768,8 +833,8 @@ func (m *Manager) startRuntimeLocked(spec panel.RelayRule) (*ruleRuntime, error)
 
 // startOneLocked starts one rule and registers its verified runtime.
 // Caller holds m.mu.
-func (m *Manager) startOneLocked(spec panel.RelayRule) error {
-	rt, err := m.startRuntimeLocked(spec)
+func (m *Manager) startOneLocked(spec panel.RelayRule, targetIP string) error {
+	rt, err := m.startRuntimeLocked(spec, targetIP)
 	if err != nil {
 		return err
 	}
@@ -782,11 +847,12 @@ func (m *Manager) startOneLocked(spec panel.RelayRule) error {
 // the old one's crash-restart history so backoff accounting survives
 // the swap attempt. Caller holds m.mu.
 func (m *Manager) restoreLocked(old *ruleRuntime) error {
-	rt, err := m.startRuntimeLocked(old.spec)
+	rt, err := m.startRuntimeLocked(old.spec, old.targetIP)
 	if err != nil {
 		return err
 	}
 	rt.restarts = old.restarts
+	rt.version = old.version
 	m.running[old.spec.RuleCode] = rt
 	return nil
 }
@@ -799,12 +865,12 @@ func (m *Manager) restoreLocked(old *ruleRuntime) error {
 // is what makes make-before-break swaps possible at all: the global
 // registries reject duplicate names, so an unsuffixed rebuild could
 // never start while its predecessor lived.
-func (m *Manager) buildRule(spec panel.RelayRule, gen int64) (rt *ruleRuntime, err error) {
+func (m *Manager) buildRule(spec panel.RelayRule, gen int64, targetIP string) (rt *ruleRuntime, err error) {
 	// built is deliberately a local, not the named return: error paths
 	// return nil for rt, and the teardown below must still reach the
 	// partially built runtime (dereferencing the named return there
 	// panics and masks the real error).
-	built := &ruleRuntime{spec: spec}
+	built := &ruleRuntime{spec: spec, targetIP: targetIP}
 	defer func() {
 		if err != nil {
 			for _, ref := range built.services {
@@ -814,16 +880,8 @@ func (m *Manager) buildRule(spec panel.RelayRule, gen int64) (rt *ruleRuntime, e
 		}
 	}()
 
-	// The panel publishes the rule's target as the final dial endpoint
-	// (for NODE targets: the hosting machine's public address + the
-	// node's effective landing port). The agent dials exactly what was
-	// published — there is deliberately no same-machine loopback
-	// shortcut: machine roles are exclusive (a machine is a landing
-	// machine or a relay machine, never both), so a relay machine never
-	// hosts its rules' target nodes, and a shortcut that silently
-	// rewrites the dial address is how the HK2 pilot masked the
-	// cross-machine addressing defect.
-	targetAddr := net.JoinHostPort(spec.TargetHost, strconv.Itoa(spec.TargetPort))
+	// The document validator pins the dial address to a checked DNS answer.
+	targetAddr := net.JoinHostPort(targetIP, strconv.Itoa(spec.TargetPort))
 
 	var transports []string
 	switch strings.ToLower(spec.Transport) {
@@ -910,7 +968,7 @@ func (m *Manager) buildRule(spec panel.RelayRule, gen int64) (rt *ruleRuntime, e
 			built.components = append(built.components, componentRef{kind: "adm", name: admName})
 			svcCfg.Admissions = []string{admName}
 		}
-		svc, perr := service_parser.ParseService(svcCfg)
+		svc, perr := parseTrackedService(svcCfg, &built.flows)
 		if perr != nil {
 			return nil, fmt.Errorf("parse service %s: %w", name, perr)
 		}
@@ -932,6 +990,7 @@ func (m *Manager) serveRule(rt *ruleRuntime, ref *svcRef) {
 	}()
 	if err := ref.svc.Serve(); err != nil && !rt.closed.Load() {
 		ref.err.Store(err.Error())
+		ref.done.Store(true)
 		nlog.Core().Error("relay service exited", "service", ref.name, "error", err)
 		m.noteSuspect(rt, err.Error())
 	}
@@ -944,7 +1003,8 @@ func (m *Manager) noteSuspect(rt *ruleRuntime, errText string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	rt.restarts = append(rt.restarts, time.Now())
-	if m.appliedVersion <= 0 || m.suspectNoted {
+	if m.appliedVersion <= 0 || m.suspectNoted || rt.closed.Load() ||
+		m.running[rt.spec.RuleCode] != rt || rt.version != m.appliedVersion {
 		return
 	}
 	m.suspectNoted = true
@@ -979,6 +1039,35 @@ func normalizeRule(r panel.RelayRule) panel.RelayRule {
 
 // ─── Traffic accounting ──────────────────────────────────────────────
 
+func (rt *ruleRuntime) drained() bool {
+	for _, ref := range rt.services {
+		if ref.finished == nil {
+			continue
+		}
+		select {
+		case <-ref.finished:
+		default:
+			return false
+		}
+	}
+	return rt.currentConns() == 0 && rt.flows.idle()
+}
+
+func (m *Manager) foldZombiesLocked() {
+	// Fold zombies whose connections have fully drained.
+	for code, list := range m.zombies {
+		keep := list[:0]
+		for _, z := range list {
+			if z.drained() {
+				m.state.Banked[code] = m.state.Banked[code].add(z.totals())
+			} else {
+				keep = append(keep, z)
+			}
+		}
+		m.zombies[code] = keep
+	}
+}
+
 func (m *Manager) ruleTotalsLocked(code string) counters {
 	total := m.state.Banked[code]
 	if rt, ok := m.running[code]; ok {
@@ -1005,18 +1094,7 @@ func (m *Manager) flushTraffic() {
 	defer m.flushMu.Unlock()
 
 	m.mu.Lock()
-	// Fold zombies whose connections have fully drained.
-	for code, list := range m.zombies {
-		keep := list[:0]
-		for _, z := range list {
-			if z.currentConns() == 0 {
-				m.state.Banked[code] = m.state.Banked[code].add(z.totals())
-			} else {
-				keep = append(keep, z)
-			}
-		}
-		m.zombies[code] = keep
-	}
+	m.foldZombiesLocked()
 
 	now := time.Now()
 	codes := make(map[string]bool)
@@ -1067,8 +1145,12 @@ func (m *Manager) flushTraffic() {
 	}
 	m.lastFlush = now
 	pending := append([]panel.RelayTrafficBatch(nil), m.state.Pending...)
-	m.saveStateLocked()
+	saveErr := m.saveStateLocked()
 	m.mu.Unlock()
+	if saveErr != nil {
+		nlog.Core().Warn("relay traffic queue could not be persisted, deferring send", "error", saveErr)
+		return
+	}
 
 	if len(pending) == 0 {
 		return
@@ -1178,8 +1260,11 @@ func (m *Manager) settleChunk(chunk []panel.RelayTrafficBatch, res *panel.RelayT
 	// Only this chunk's identities are in the settled set, so batches
 	// from later chunks (not yet sent) survive untouched.
 	m.state.Pending = kept
-	m.saveStateLocked()
+	saveErr := m.saveStateLocked()
 	m.mu.Unlock()
+	if saveErr != nil {
+		nlog.Core().Error("relay traffic settlement could not be persisted", "error", saveErr)
+	}
 	return true
 }
 
@@ -1251,19 +1336,22 @@ func (m *Manager) loadState() {
 }
 
 // saveStateLocked persists the traffic state atomically. Caller holds m.mu.
-func (m *Manager) saveStateLocked() {
+func (m *Manager) saveStateLocked() error {
+	if err := os.MkdirAll(m.stateDir, 0o755); err != nil {
+		return fmt.Errorf("create relay state directory: %w", err)
+	}
 	raw, err := json.Marshal(m.state)
 	if err != nil {
-		return
+		return fmt.Errorf("encode relay state: %w", err)
 	}
 	tmp := m.statePath() + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		nlog.Core().Warn("relay state write failed", "error", err)
-		return
+		return fmt.Errorf("write relay state: %w", err)
 	}
 	if err := os.Rename(tmp, m.statePath()); err != nil {
-		nlog.Core().Warn("relay state rename failed", "error", err)
+		return fmt.Errorf("rename relay state: %w", err)
 	}
+	return nil
 }
 
 func fdUsage() (float64, error) {

@@ -434,6 +434,7 @@ func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert)
 		"tag":         nc.Protocol + "-in",
 		"listen":      "::",
 		"listen_port": nc.ServerPort,
+		"reuse_addr":  true, // allow a replacement instance to bind before the old one drains
 	}
 
 	switch nc.Protocol {
