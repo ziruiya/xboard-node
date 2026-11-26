@@ -291,7 +291,7 @@ func TestBatch5RelayRejectsResolvedLocalLoops(t *testing.T) {
 					&net.IPNet{IP: net.ParseIP("192.0.2.19"), Mask: net.CIDRMask(24, 32)},
 				}, nil
 			}
-			targets, err := resolveRelayTargets(ctx, desired, interfaceAddrs)
+			targets, err := resolveRelayTargets(ctx, desired, nil, interfaceAddrs)
 			if !tc.wantLoop {
 				if err != nil || targets["source"] != tc.host {
 					t.Fatalf("expected allowed pinned target, got %v, %v", targets, err)
@@ -313,5 +313,23 @@ func TestBatch5RelayRejectsResolvedLocalLoops(t *testing.T) {
 				t.Fatalf("expected loop rejection before startup, got %v", client.acks)
 			}
 		})
+	}
+}
+
+func TestBatch5RelayRejectsLoopToRemovedRunningListener(t *testing.T) {
+	running := []panel.RelayRule{
+		{RuleCode: "A", Transport: "tcp", ListenIP: "0.0.0.0", ListenPort: 20001, TargetHost: "192.0.2.50", TargetPort: 443},
+	}
+	desired := map[string]panel.RelayRule{
+		"B": {RuleCode: "B", Transport: "tcp", ListenIP: "127.0.0.1", ListenPort: 20002, TargetHost: "localhost", TargetPort: 20001},
+	}
+	interfaceAddrs := func() ([]net.Addr, error) {
+		return []net.Addr{
+			&net.IPNet{IP: net.ParseIP("127.0.0.1"), Mask: net.CIDRMask(8, 32)},
+		}, nil
+	}
+	targets, err := resolveRelayTargets(context.Background(), desired, running, interfaceAddrs)
+	if targets != nil || err == nil || !strings.Contains(err.Error(), "loops to local tcp listener of rule A") {
+		t.Fatalf("expected document rejection for a loop to running rule A, got %v, %v", targets, err)
 	}
 }

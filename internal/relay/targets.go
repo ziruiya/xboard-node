@@ -10,11 +10,16 @@ import (
 	"github.com/cedar2025/xboard-node/internal/panel"
 )
 
-func resolveRelayTargets(ctx context.Context, desired map[string]panel.RelayRule, interfaceAddrs func() ([]net.Addr, error)) (map[string]string, error) {
+func resolveRelayTargets(ctx context.Context, desired map[string]panel.RelayRule, running []panel.RelayRule, interfaceAddrs func() ([]net.Addr, error)) (map[string]string, error) {
 	targets := make(map[string]string, len(desired))
 	if len(desired) == 0 {
 		return targets, nil
 	}
+	listeners := make([]panel.RelayRule, 0, len(desired)+len(running))
+	for _, spec := range desired {
+		listeners = append(listeners, spec)
+	}
+	listeners = append(listeners, running...)
 	addrs, err := interfaceAddrs()
 	if err != nil {
 		return nil, fmt.Errorf("enumerate relay interface addresses: %w", err)
@@ -45,7 +50,7 @@ func resolveRelayTargets(ctx context.Context, desired map[string]panel.RelayRule
 			cache[spec.TargetHost] = ips
 		}
 		for _, ip := range ips {
-			if err := checkRelayTarget(spec, ip, local, desired); err != nil {
+			if err := checkRelayTarget(spec, ip, local, listeners); err != nil {
 				return nil, err
 			}
 		}
@@ -54,13 +59,13 @@ func resolveRelayTargets(ctx context.Context, desired map[string]panel.RelayRule
 	return targets, nil
 }
 
-func checkRelayTarget(spec panel.RelayRule, ip netip.Addr, local map[netip.Addr]bool, desired map[string]panel.RelayRule) error {
+func checkRelayTarget(spec panel.RelayRule, ip netip.Addr, local map[netip.Addr]bool, listeners []panel.RelayRule) error {
 	ip = ip.Unmap().WithZone("")
 	if !local[ip] {
 		return nil
 	}
 	transports := specTransports(spec)
-	for _, listener := range desired {
+	for _, listener := range listeners {
 		if spec.TargetPort == 0 || spec.TargetPort != listener.ListenPort {
 			continue
 		}

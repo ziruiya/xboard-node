@@ -408,7 +408,16 @@ func (m *Manager) apply(ctx context.Context, doc *panel.RelayDocument, ackHash .
 		}
 	}
 
-	targets, err := resolveRelayTargets(ctx, desired, m.interfaceAddrs)
+	// Snapshot the running specs so DNS stays outside the lock and the
+	// two-phase apply starts only after target validation succeeds.
+	m.mu.Lock()
+	running := make([]panel.RelayRule, 0, len(m.running))
+	for _, rt := range m.running {
+		running = append(running, rt.spec)
+	}
+	m.mu.Unlock()
+
+	targets, err := resolveRelayTargets(ctx, desired, running, m.interfaceAddrs)
 	if err != nil {
 		return err
 	}
