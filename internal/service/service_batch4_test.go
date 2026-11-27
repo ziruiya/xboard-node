@@ -100,8 +100,8 @@ func TestApplyPullResultSyncsMailboxBaseline(t *testing.T) {
 	mb.SeedBaseline([]model.UserSpec{{ID: 1, UUID: "a"}, {ID: 2, UUID: "b"}}, nil)
 	s.machineMailbox = mb
 
-	// REST snapshot: user 2 is gone at the panel.
-	restUsers := []model.UserSpec{{ID: 1, UUID: "a"}}
+	// REST clears all users at the panel.
+	restUsers := []model.UserSpec{}
 	s.applyPullResult(context.Background(), pullResult{
 		users:    restUsers,
 		userHash: computeUserHash(restUsers),
@@ -115,10 +115,7 @@ func TestApplyPullResultSyncsMailboxBaseline(t *testing.T) {
 	})
 	mb.MarkReady()
 	state := mb.DrainIfReady()
-	if !state.HasUsers {
-		t.Fatal("drain returned no users")
-	}
-	if len(state.Users) != 2 || state.Users[0].ID != 1 || state.Users[1].ID != 3 {
-		t.Fatalf("drained users = %+v, want IDs [1 3] — user 2 must not be resurrected", state.Users)
+	if s.lastUsers == nil || len(s.lastUsers) != 0 || state.HasUsers || !state.NeedsReconcile {
+		t.Fatalf("clear or reconcile lost: users=%v mailbox=%+v", s.lastUsers, state)
 	}
 }

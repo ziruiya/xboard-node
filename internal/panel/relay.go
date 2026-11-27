@@ -103,8 +103,7 @@ func (c *Client) FetchRelayConfig() (*RelayConfigResponse, error) {
 	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("relay config status %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("relay config status %d (%s)", resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 	var out RelayConfigResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -148,8 +147,7 @@ func (c *Client) PostRelayTraffic(batches []RelayTrafficBatch) (*RelayTrafficRes
 	}
 	defer drainAndClose(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("relay traffic status %d: %s", resp.StatusCode, respBody)
+		return nil, fmt.Errorf("relay traffic status %d (%s)", resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 	var envelope struct {
 		Status string             `json:"status"`

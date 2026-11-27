@@ -96,24 +96,11 @@ func (p *MachinePanelControlPlane) Initial(
 }
 
 func (p *MachinePanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
-	configSnapshot, err := p.client.GetConfig()
+	snapshot, err := pollPanelSnapshot(ctx, p.client, p.kcfg)
 	if err != nil {
-		return Snapshot{}, fmt.Errorf("machine poll config: %w", err)
+		return Snapshot{}, fmt.Errorf("machine %w", err)
 	}
-	users, err := p.client.GetUsers()
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("machine poll users: %w", err)
-	}
-	select {
-	case <-ctx.Done():
-		return Snapshot{}, ctx.Err()
-	default:
-	}
-	nodeSpec, err := model.NodeSpecFromPanelValidated(configSnapshot, p.kcfg)
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("machine poll normalize: %w", err)
-	}
-	return Snapshot{Config: nodeSpec, Users: model.UserSpecsFromPanel(users)}, nil
+	return snapshot, nil
 }
 
 func (p *MachinePanelControlPlane) Discover(

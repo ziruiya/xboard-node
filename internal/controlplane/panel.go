@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -19,7 +20,8 @@ type PanelControlPlane struct {
 }
 
 type panelPushClient struct {
-	inner *panel.WSClient
+	inner   *panel.WSClient
+	dropped atomic.Bool
 }
 
 func NewPanelControlPlane(panelCfg config.PanelConfig, wsCfg config.WSConfig, kcfg config.KernelConfig) *PanelControlPlane {
@@ -69,11 +71,19 @@ func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[st
 }
 
 func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
-	configSnapshot, err := p.client.GetConfig()
+	return pollPanelSnapshot(ctx, p.client, p.kcfg)
+}
+
+func pollPanelSnapshot(ctx context.Context, client *panel.Client, kcfg config.KernelConfig) (Snapshot, error) {
+	if ctx.Value(fullPollKey{}) != nil {
+		client.ResetETags()
+	}
+	var configETag, userETag string
+	configSnapshot, err := client.GetConfig(&configETag)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("poll config: %w", err)
 	}
-	users, err := p.client.GetUsers()
+	users, err := client.GetUsers(&userETag)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("poll users: %w", err)
 	}
@@ -82,11 +92,20 @@ func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 		return Snapshot{}, ctx.Err()
 	default:
 	}
-	nodeSpec, err := model.NodeSpecFromPanelValidated(configSnapshot, p.kcfg)
+	nodeSpec, err := model.NodeSpecFromPanelValidated(configSnapshot, kcfg)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("poll config normalize: %w", err)
 	}
-	return Snapshot{Config: nodeSpec, Users: model.UserSpecsFromPanel(users)}, nil
+	return Snapshot{Config: nodeSpec, Users: model.UserSpecsFromPanel(users), Commit: func(configApplied, usersApplied bool) {
+		var configTag, userTag *string
+		if configApplied && configSnapshot != nil {
+			configTag = &configETag
+		}
+		if usersApplied && users != nil {
+			userTag = &userETag
+		}
+		client.CommitETags(configTag, userTag)
+	}}, nil
 }
 
 func (p *PanelControlPlane) Discover(ctx context.Context, metricsFn func() map[string]interface{}, events chan<- Event, statuses chan<- StatusChange) (PushClient, error) {
@@ -136,7 +155,8 @@ func (p *PanelControlPlane) newPushClient(metricsFn func() map[string]interface{
 		BackoffInitial:   time.Duration(p.wsCfg.BackoffInitial) * time.Second,
 		BackoffMax:       time.Duration(p.wsCfg.BackoffMax) * time.Second,
 	}
-	inner := panel.NewWSClient(
+	push := &panelPushClient{}
+	push.inner = panel.NewWSClient(
 		wsURL,
 		p.cfg.Token,
 		p.cfg.NodeID,
@@ -151,10 +171,7 @@ func (p *PanelControlPlane) newPushClient(metricsFn func() map[string]interface{
 			case events <- translated:
 			default:
 				nlog.Core().Warn("ws event channel full, dropping event", "type", translated.Type)
-				select {
-				case statuses <- StatusChange{Connected: true, NeedsResync: true}:
-				default:
-				}
+				push.dropped.Store(true)
 			}
 		},
 		func(status panel.WSStatusChange) {
@@ -165,7 +182,7 @@ func (p *PanelControlPlane) newPushClient(metricsFn func() map[string]interface{
 		},
 		metricsFn,
 	)
-	return &panelPushClient{inner: inner}
+	return push
 }
 
 func TranslateWSEvent(event panel.WSEvent, kcfg config.KernelConfig) (Event, error) {
@@ -191,3 +208,5 @@ func (p *panelPushClient) IsConnected() bool       { return p.inner.IsConnected(
 func (p *panelPushClient) SendDeviceReport(devices map[int][]string) {
 	p.inner.SendDeviceReport(devices)
 }
+
+func (p *panelPushClient) TakeDroppedEvents() bool { return p.dropped.Swap(false) }

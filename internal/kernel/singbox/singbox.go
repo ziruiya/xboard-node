@@ -61,9 +61,7 @@ type SingBox struct {
 	// Set once by SetDeviceLimitFunc and forwarded to every new ConnTracker.
 	deviceLimitFunc func(string) (int, bool)
 
-	// trackerRegistered prevents duplicate AppendTracker calls on the same
-	// Router instance during Reload. Reset to false on full restart.
-	trackerRegistered bool
+	retiredTrackers map[*ConnTracker]map[string]int
 }
 
 func New(cfg config.KernelConfig) *SingBox {
@@ -129,6 +127,7 @@ func (s *SingBox) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec
 	oldCancel := s.cancel
 	oldCtx := s.ctx
 	oldTracker := s.connTracker
+	oldUsers := s.users
 
 	instance, err := box.New(box.Options{
 		Context: ctx,
@@ -138,6 +137,18 @@ func (s *SingBox) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec
 		cancel()
 		return fmt.Errorf("create sing-box instance: %w", err)
 	}
+
+	// Fresh tracker on full restart.
+	tracker := NewConnTracker(0)
+	tracker.SetUserMap(buildUserMap(users))
+	if s.speedLimitFunc != nil {
+		tracker.SetSpeedLimitFunc(s.speedLimitFunc)
+	}
+	if s.deviceLimitFunc != nil {
+		tracker.SetDeviceLimitFunc(s.deviceLimitFunc)
+	}
+
+	instance.Router().AppendTracker(tracker)
 
 	if err := instance.Start(); err != nil {
 		instance.Close()
@@ -154,22 +165,23 @@ func (s *SingBox) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec
 	s.nodeConfig = nodeConfig
 	s.tls = tls
 
-	// Fresh tracker on full restart.
-	s.connTracker = NewConnTracker(0)
-	s.connTracker.SetUserMap(buildUserMap(users))
-	if s.speedLimitFunc != nil {
-		s.connTracker.SetSpeedLimitFunc(s.speedLimitFunc)
-	}
-	if s.deviceLimitFunc != nil {
-		s.connTracker.SetDeviceLimitFunc(s.deviceLimitFunc)
-	}
-
-	s.trackerRegistered = false
-	s.registerTracker(ctx)
+	s.connTracker = tracker
 
 	// Recycle old instance in background — drain then close.
 	if oldBox != nil {
-		go recycleOldBox(oldBox, oldCancel, oldCtx, oldTracker)
+		if oldTracker != nil {
+			if s.retiredTrackers == nil {
+				s.retiredTrackers = make(map[*ConnTracker]map[string]int)
+			}
+			s.retiredTrackers[oldTracker] = buildUserMap(oldUsers)
+			s.updateTrackerUsersLocked(users)
+		}
+		go func() {
+			recycleOldBox(oldBox, oldCancel, oldCtx, oldTracker)
+			s.mu.Lock()
+			delete(s.retiredTrackers, oldTracker)
+			s.mu.Unlock()
+		}()
 	}
 
 	nlog.Core().Debug("sing-box started", "users", len(users))
@@ -327,9 +339,7 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 
 	// Trackers remain registered on the Router (which survives ReloadUsers).
 	// Only update the user map — do NOT re-register or traffic is double-counted.
-	if s.connTracker != nil {
-		s.connTracker.SetUserMap(buildUserMap(users))
-	}
+	s.updateTrackerUsersLocked(users)
 
 	nlog.Core().Debug("sing-box reloaded", "users", len(users))
 	s.users = users
@@ -338,21 +348,22 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 	return nil
 }
 
-// registerTracker wires the ConnTracker to the current Router exactly once.
-// The ConnTracker handles both byte counting and optional rate limiting
-// in a single wrapper, so no additional trackers are needed.
-func (s *SingBox) registerTracker(ctx context.Context) {
-	if s.trackerRegistered {
-		return
-	}
-	router := service.FromContext[adapter.Router](ctx)
-	if router == nil {
-		return
-	}
+// updateTrackerUsersLocked revokes users from active and retiring generations.
+func (s *SingBox) updateTrackerUsersLocked(users []model.UserSpec) {
+	allowed := buildUserMap(users)
 	if s.connTracker != nil {
-		router.AppendTracker(s.connTracker)
+		s.connTracker.SetUserMap(allowed)
 	}
-	s.trackerRegistered = true
+	for tracker, previous := range s.retiredTrackers {
+		remaining := make(map[string]int, len(previous))
+		for uuid, uid := range previous {
+			if current, ok := allowed[uuid]; ok && current == uid {
+				remaining[uuid] = uid
+			}
+		}
+		tracker.SetUserMap(remaining)
+		s.retiredTrackers[tracker] = remaining
+	}
 }
 
 func (s *SingBox) Stop() {
@@ -362,6 +373,10 @@ func (s *SingBox) Stop() {
 }
 
 func (s *SingBox) stop() {
+	for tracker := range s.retiredTrackers {
+		tracker.SetUserMap(nil)
+		s.retiredTrackers[tracker] = nil
+	}
 	if s.box == nil {
 		return
 	}
@@ -529,9 +544,7 @@ func (s *SingBox) UpdateUsers(users []model.UserSpec) (added, removed int, err e
 
 	if added == 0 && removed == 0 {
 		// Only limits may have changed — update tracker map.
-		if s.connTracker != nil {
-			s.connTracker.SetUserMap(buildUserMap(users))
-		}
+		s.updateTrackerUsersLocked(users)
 		s.users = users
 		return 0, 0, nil
 	}
@@ -652,9 +665,7 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 		}
 	}
 
-	if s.connTracker != nil {
-		s.connTracker.SetUserMap(buildUserMap(users))
-	}
+	s.updateTrackerUsersLocked(users)
 
 	nlog.Core().Debug("sing-box users hot-swapped", "users", len(users))
 	return nil
@@ -684,11 +695,14 @@ func (s *SingBox) CloseConnection(_ context.Context, connID string) error {
 
 // CloseUserConnections terminates all connections for a user UUID.
 func (s *SingBox) CloseUserConnections(_ context.Context, uuid string) error {
-	ct := s.connTrackerSafe()
-	if ct == nil {
-		return nil
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.connTracker != nil {
+		s.connTracker.CloseByUUID(uuid)
 	}
-	ct.CloseByUUID(uuid)
+	for tracker := range s.retiredTrackers {
+		tracker.CloseByUUID(uuid)
+	}
 	return nil
 }
 

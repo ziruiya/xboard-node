@@ -134,11 +134,12 @@ func TestEmptyAuthInbound(t *testing.T) {
 						t.Fatal(err)
 					}
 					assertClosed(t, "after clear")
-					// The ticket permits either behavior for already authenticated tunnels.
-					if err := authTestEcho(existing, "after clear"); err != nil {
-						t.Logf("existing tunnel no longer relayed data after clear: %v", err)
-					} else {
-						t.Log("existing tunnel still relayed data after clear")
+					var b [1]byte
+					_ = existing.SetReadDeadline(time.Now().Add(time.Second))
+					n, err := existing.Read(b[:])
+					var timeout net.Error
+					if n != 0 || err == nil || (errors.As(err, &timeout) && timeout.Timeout()) {
+						t.Fatalf("established authenticated tunnel survived revocation: read %d, error %v", n, err)
 					}
 				})
 				if t.Failed() {

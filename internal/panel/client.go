@@ -91,8 +91,7 @@ func (c *Client) Handshake() (*HandshakeResponse, error) {
 	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("handshake status %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("handshake status %d (%s)", resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 
 	var hs HandshakeResponse
@@ -236,7 +235,8 @@ func (c *Client) userPath() string {
 }
 
 // GetConfig fetches node configuration. Returns nil if not modified (304).
-func (c *Client) GetConfig() (*NodeConfig, error) {
+// If provided, stage receives the response validator for later commit.
+func (c *Client) GetConfig(stage ...*string) (*NodeConfig, error) {
 	resp, err := c.doRequest("GET", c.configPath(), nil, c.configETag)
 	if err != nil {
 		return nil, fmt.Errorf("get config: %w", err)
@@ -247,8 +247,7 @@ func (c *Client) GetConfig() (*NodeConfig, error) {
 		return nil, nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("status %d (%s)", resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 
 	var raw map[string]interface{}
@@ -259,7 +258,7 @@ func (c *Client) GetConfig() (*NodeConfig, error) {
 	var cfg NodeConfig
 	// Use mapstructure for weak type conversion (string -> int, bool -> string, etc.)
 	if err := decodeWeakRaw(raw, &cfg); err != nil {
-		return nil, fmt.Errorf("weak decode config: %w", err)
+		return nil, fmt.Errorf("weak decode config: invalid field types (%T)", err)
 	}
 
 	// Basic validation
@@ -267,14 +266,15 @@ func (c *Client) GetConfig() (*NodeConfig, error) {
 		return nil, fmt.Errorf("invalid config: missing protocol")
 	}
 
-	if etag := resp.Header.Get("ETag"); etag != "" {
-		c.configETag = etag
+	if len(stage) > 0 {
+		*stage[0] = resp.Header.Get("ETag")
 	}
 	return &cfg, nil
 }
 
 // GetUsers fetches available users. Returns nil if not modified (304).
-func (c *Client) GetUsers() ([]User, error) {
+// If provided, stage receives the response validator for later commit.
+func (c *Client) GetUsers(stage ...*string) ([]User, error) {
 	resp, err := c.doRequest("GET", c.userPath(), nil, c.userETag)
 	if err != nil {
 		return nil, fmt.Errorf("get users: %w", err)
@@ -285,8 +285,7 @@ func (c *Client) GetUsers() ([]User, error) {
 		return nil, nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("status %d (%s)", resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 
 	var usersResp UsersResponse
@@ -294,8 +293,11 @@ func (c *Client) GetUsers() ([]User, error) {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
 
-	if etag := resp.Header.Get("ETag"); etag != "" {
-		c.userETag = etag
+	if usersResp.Users == nil {
+		return nil, fmt.Errorf("missing users array")
+	}
+	if len(stage) > 0 {
+		*stage[0] = resp.Header.Get("ETag")
 	}
 	return usersResp.Users, nil
 }
@@ -335,7 +337,17 @@ func (c *Client) PushStatus(cpu float64, mem, swap, disk [2]uint64) error {
 	return c.postJSON("/api/v1/server/UniProxy/status", payload)
 }
 
-// ResetETags clears cached ETags, forcing full responses
+// CommitETags records the validators for successfully applied resources.
+func (c *Client) CommitETags(config, users *string) {
+	if config != nil {
+		c.configETag = *config
+	}
+	if users != nil {
+		c.userETag = *users
+	}
+}
+
+// ResetETags clears cached ETags, forcing full responses.
 func (c *Client) ResetETags() {
 	c.configETag = ""
 	c.userETag = ""
@@ -350,8 +362,7 @@ func (c *Client) GetMachineNodes() (*MachineNodesResponse, error) {
 	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("machine nodes status %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("machine nodes status %d (%s)", resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 
 	var out MachineNodesResponse
@@ -426,8 +437,7 @@ func (c *Client) postJSON(path string, payload map[string]interface{}) error {
 	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("status %d: %s", resp.StatusCode, respBody)
+		return fmt.Errorf("status %d (%s)", resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 	c.apiSuccess.Add(1)
 	return nil
@@ -450,7 +460,7 @@ func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string)
 
 	req, err := http.NewRequest(method, fullURL, bodyReader)
 	if err != nil {
-		return nil, err
+		return nil, withoutRequestURL(err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -464,7 +474,7 @@ func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		c.apiFailure.Add(1)
-		return nil, err
+		return nil, withoutRequestURL(err)
 	}
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
@@ -475,6 +485,14 @@ func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string)
 
 	nlog.Core().Debug("panel response", "method", method, "path", path, "status", resp.StatusCode)
 	return resp, nil
+}
+
+// withoutRequestURL keeps the transport cause and strips the credential-bearing URL.
+func withoutRequestURL(err error) error {
+	if e, ok := err.(*url.Error); ok {
+		return &url.Error{Op: e.Op, URL: "[redacted]", Err: withoutRequestURL(e.Err)}
+	}
+	return err
 }
 
 // drainAndClose reads any remaining bytes (up to 512B) and closes the body.

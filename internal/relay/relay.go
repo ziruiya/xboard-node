@@ -22,6 +22,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -606,13 +607,19 @@ func (m *Manager) apply(ctx context.Context, doc *panel.RelayDocument, ackHash .
 		m.closeRuntimeLocked(rt)
 		delete(m.running, rt.spec.RuleCode)
 	}
-	if draining {
-		stopped := m.zombieRuntimesLocked()
+	stopped := m.zombieRuntimesLocked()
+	if len(stopped) != 0 {
 		m.mu.Unlock()
 		m.waitDrain(ctx, stopped)
 		m.mu.Lock()
 	}
 	if len(ackHash) != 0 {
+		// Persist the final retired-generation counters before publishing success.
+		m.collectTrafficLocked()
+		if err := m.saveStateLocked(); err != nil {
+			m.mu.Unlock()
+			return fmt.Errorf("persist relay traffic before ACK: %w", err)
+		}
 		for _, rt := range m.running {
 			rt.version = doc.Version
 		}
@@ -1088,21 +1095,8 @@ func (m *Manager) ruleTotalsLocked(code string) counters {
 	return total
 }
 
-// flushTraffic folds idle zombies, turns counter deltas into durable
-// batches, and sends the pending queue. Batches are persisted before
-// sending; a failed send leaves them queued with their original ids.
-//
-// NODE-003: the whole flush is serialized on flushMu. The ticker flush
-// and the shutdown flush used to interleave — the network send happens
-// outside m.mu, and the older flush's unconditional queue clear could
-// delete batches a younger flush had just enqueued (and not yet sent
-// successfully). Settlement now removes exactly the batches the panel
-// accounted for, by identity, never the whole queue by position.
-func (m *Manager) flushTraffic() {
-	m.flushMu.Lock()
-	defer m.flushMu.Unlock()
-
-	m.mu.Lock()
+// collectTrafficLocked moves sampled deltas into the pending queue.
+func (m *Manager) collectTrafficLocked() {
 	m.foldZombiesLocked()
 
 	now := time.Now()
@@ -1153,6 +1147,24 @@ func (m *Manager) flushTraffic() {
 		m.state.Reported[code] = total
 	}
 	m.lastFlush = now
+}
+
+// flushTraffic folds idle zombies, turns counter deltas into durable
+// batches, and sends the pending queue. Batches are persisted before
+// sending; a failed send leaves them queued with their original ids.
+//
+// NODE-003: the whole flush is serialized on flushMu. The ticker flush
+// and the shutdown flush used to interleave — the network send happens
+// outside m.mu, and the older flush's unconditional queue clear could
+// delete batches a younger flush had just enqueued (and not yet sent
+// successfully). Settlement now removes exactly the batches the panel
+// accounted for, by identity, never the whole queue by position.
+func (m *Manager) flushTraffic() {
+	m.flushMu.Lock()
+	defer m.flushMu.Unlock()
+
+	m.mu.Lock()
+	m.collectTrafficLocked()
 	pending := append([]panel.RelayTrafficBatch(nil), m.state.Pending...)
 	saveErr := m.saveStateLocked()
 	m.mu.Unlock()
@@ -1354,11 +1366,28 @@ func (m *Manager) saveStateLocked() error {
 		return fmt.Errorf("encode relay state: %w", err)
 	}
 	tmp := m.statePath() + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("open relay state: %w", err)
+	}
+	_, writeErr := f.Write(raw)
+	if writeErr == nil {
+		writeErr = f.Sync()
+	}
+	closeErr := f.Close()
+	if err := errors.Join(writeErr, closeErr); err != nil {
 		return fmt.Errorf("write relay state: %w", err)
 	}
 	if err := os.Rename(tmp, m.statePath()); err != nil {
 		return fmt.Errorf("rename relay state: %w", err)
+	}
+	dir, err := os.Open(m.stateDir)
+	if err != nil {
+		return fmt.Errorf("open relay state directory: %w", err)
+	}
+	defer dir.Close()
+	if err := dir.Sync(); err != nil {
+		return fmt.Errorf("sync relay state directory: %w", err)
 	}
 	return nil
 }

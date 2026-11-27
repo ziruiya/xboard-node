@@ -43,7 +43,16 @@ type Bootstrap struct {
 	Mailbox      *NodeMailbox
 }
 
+type fullPollKey struct{}
+
+// FullPoll requests an unconditional snapshot for reconciliation.
+func FullPoll(ctx context.Context) context.Context {
+	return context.WithValue(ctx, fullPollKey{}, true)
+}
+
 type Snapshot struct {
+	// Commit advances validators for the resources accepted by the service loop.
+	Commit func(configApplied, usersApplied bool)
 	Config *model.NodeSpec
 	Users  []model.UserSpec
 }

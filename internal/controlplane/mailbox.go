@@ -45,9 +45,7 @@ func (m *NodeMailbox) MarkReady() {
 	m.notify()
 }
 
-// SeedBaseline initializes the mailbox with the REST-derived baseline so that
-// subsequent delta events can be applied incrementally instead of triggering
-// a full REST reconciliation.
+// SeedBaseline initializes the mailbox from the REST startup snapshot.
 func (m *NodeMailbox) SeedBaseline(users []model.UserSpec, config *model.NodeSpec) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -120,18 +118,9 @@ func (m *NodeMailbox) Apply(event Event) {
 			changed = true
 		}
 	case EventSyncUserDelta:
-		if len(event.DeltaUsers) > 0 {
-			if !m.hasFullUserState {
-				m.needsReconcile = true
-				changed = true
-			} else if !applyUserDelta(&m.users, event.DeltaAction, event.DeltaUsers) {
-				m.needsReconcile = true
-				changed = true
-			} else {
-				m.dirtyUsers = true
-				changed = true
-			}
-		}
+		// Legacy deltas carry no base revision, even with a full local baseline.
+		m.needsReconcile = true
+		changed = true
 	}
 	m.mu.Unlock()
 
@@ -255,42 +244,4 @@ func cloneDeviceUsers(devices map[int][]string) map[int][]string {
 		cloned[uid] = dup
 	}
 	return cloned
-}
-
-func applyUserDelta(users *[]model.UserSpec, action string, delta []model.UserSpec) bool {
-	current := cloneUsers(*users)
-	index := make(map[int]int, len(current))
-	for i, user := range current {
-		index[user.ID] = i
-	}
-
-	switch action {
-	case "add":
-		for _, user := range delta {
-			if idx, ok := index[user.ID]; ok {
-				current[idx] = user
-				continue
-			}
-			index[user.ID] = len(current)
-			current = append(current, user)
-		}
-	case "remove":
-		removeIDs := make(map[int]struct{}, len(delta))
-		for _, user := range delta {
-			removeIDs[user.ID] = struct{}{}
-		}
-		filtered := current[:0]
-		for _, user := range current {
-			if _, ok := removeIDs[user.ID]; ok {
-				continue
-			}
-			filtered = append(filtered, user)
-		}
-		current = append([]model.UserSpec(nil), filtered...)
-	default:
-		return false
-	}
-
-	*users = current
-	return true
 }

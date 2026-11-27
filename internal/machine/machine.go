@@ -48,9 +48,7 @@ type Orchestrator struct {
 	ws       *panel.WSClient
 	wsCancel context.CancelFunc
 
-	// runCtx is stored from Run() so that onWSEvent can trigger rediscover
-	// for sync.nodes events without blocking the main loop.
-	runCtx context.Context
+	discoveryRequested chan struct{}
 
 	// relayDone is closed when the relay manager's Run returns (after
 	// its shutdown flush). NODE-009: Run waits for it so the process
@@ -70,17 +68,17 @@ func New(cfg *config.Config) *Orchestrator {
 		MachineID: cfg.Machine.MachineID,
 	}
 	return &Orchestrator{
-		cfg:       cfg,
-		client:    panel.NewClient(panelCfg),
-		nodes:     make(map[int]*nodeHandle),
-		mailboxes: make(map[int]*controlplane.NodeMailbox),
-		statuses:  make(map[int]chan<- controlplane.StatusChange),
+		cfg:                cfg,
+		client:             panel.NewClient(panelCfg),
+		nodes:              make(map[int]*nodeHandle),
+		mailboxes:          make(map[int]*controlplane.NodeMailbox),
+		statuses:           make(map[int]chan<- controlplane.StatusChange),
+		discoveryRequested: make(chan struct{}, 1),
 	}
 }
 
 // Run is the main loop. It blocks until ctx is cancelled.
 func (o *Orchestrator) Run(ctx context.Context) error {
-	o.runCtx = ctx
 	nodesResp, err := o.client.GetMachineNodes()
 	if err != nil {
 		return fmt.Errorf("initial node discovery: %w", err)
@@ -129,6 +127,8 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			return nil
 
 		case <-discoveryTicker.C:
+			o.rediscover(ctx)
+		case <-o.discoveryRequested:
 			o.rediscover(ctx)
 
 		case <-statusTicker.C:
@@ -185,7 +185,7 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 	// the node mailbox + status channel to the Service.
 	nodeID := mn.ID
 	registerFn := func(st chan<- controlplane.StatusChange) *controlplane.NodeMailbox {
-		o.registerNode(nodeID, st)
+		o.registerNode(nodeID, mb, st)
 		return mb
 	}
 
@@ -197,7 +197,7 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 
 	go func() {
 		defer close(done)
-		defer o.unregisterNode(mn.ID)
+		defer o.unregisterNode(mn.ID, mb)
 		if err := svc.Run(nodeCtx); err != nil {
 			nlog.Core().Error("machine node exited with error",
 				"node_id", mn.ID, "error", err)
@@ -215,9 +215,7 @@ func (o *Orchestrator) stopNode(nodeID int) {
 	delete(o.nodes, nodeID)
 	o.mu.Unlock()
 
-	o.eventsMu.Lock()
-	delete(o.mailboxes, nodeID)
-	o.eventsMu.Unlock()
+	o.unregisterNode(nodeID, h.mailbox)
 
 	nlog.Core().Info(fmt.Sprintf("machine: stopping node %d", nodeID))
 	h.cancel()
@@ -254,6 +252,9 @@ func (o *Orchestrator) rediscover(ctx context.Context) {
 		return
 	}
 
+	if ctx.Err() != nil {
+		return
+	}
 	wanted := make(map[int]panel.MachineNode, len(nodesResp.Nodes))
 	for _, n := range nodesResp.Nodes {
 		wanted[n.ID] = n
@@ -336,7 +337,10 @@ func (o *Orchestrator) onWSEvent(event panel.WSEvent) {
 	// sync.nodes is a machine-level event, not per-node
 	if event.Type == panel.WSEventSyncNodes {
 		nlog.Core().Info("machine received sync.nodes, triggering immediate rediscovery")
-		go o.rediscover(o.runCtx)
+		select {
+		case o.discoveryRequested <- struct{}{}:
+		default:
+		}
 		return
 	}
 
@@ -376,16 +380,20 @@ func (o *Orchestrator) onWSStatus(status panel.WSStatusChange) {
 	}
 }
 
-func (o *Orchestrator) registerNode(nodeID int, st chan<- controlplane.StatusChange) {
+func (o *Orchestrator) registerNode(nodeID int, mb *controlplane.NodeMailbox, st chan<- controlplane.StatusChange) {
 	o.eventsMu.Lock()
-	o.statuses[nodeID] = st
+	if o.mailboxes[nodeID] == mb {
+		o.statuses[nodeID] = st
+	}
 	o.eventsMu.Unlock()
 }
 
-func (o *Orchestrator) unregisterNode(nodeID int) {
+func (o *Orchestrator) unregisterNode(nodeID int, mb *controlplane.NodeMailbox) {
 	o.eventsMu.Lock()
-	delete(o.mailboxes, nodeID)
-	delete(o.statuses, nodeID)
+	if o.mailboxes[nodeID] == mb {
+		delete(o.mailboxes, nodeID)
+		delete(o.statuses, nodeID)
+	}
 	o.eventsMu.Unlock()
 }
 

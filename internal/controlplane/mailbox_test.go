@@ -97,7 +97,7 @@ func TestNodeMailboxReconcileNotifies(t *testing.T) {
 	}
 }
 
-func TestNodeMailboxSeedBaselineEnablesDelta(t *testing.T) {
+func TestNodeMailboxSeededBaselineRequiresVersionedDelta(t *testing.T) {
 	mb := NewNodeMailbox()
 	mb.SeedBaseline([]model.UserSpec{{ID: 1, UUID: "u1"}, {ID: 2, UUID: "u2"}}, nil)
 	mb.MarkReady()
@@ -108,7 +108,7 @@ func TestNodeMailboxSeedBaselineEnablesDelta(t *testing.T) {
 	default:
 	}
 
-	// Delta should now apply incrementally, not trigger reconcile
+	// A delta without a base revision still requires full reconciliation.
 	mb.Apply(Event{
 		Type:        EventSyncUserDelta,
 		DeltaAction: "add",
@@ -122,14 +122,8 @@ func TestNodeMailboxSeedBaselineEnablesDelta(t *testing.T) {
 	}
 
 	state := mb.DrainIfReady()
-	if state.NeedsReconcile {
-		t.Fatal("should not need reconcile after seeded baseline")
-	}
-	if !state.HasUsers {
-		t.Fatal("expected users")
-	}
-	if len(state.Users) != 3 {
-		t.Fatalf("expected 3 users, got %d: %+v", len(state.Users), state.Users)
+	if !state.NeedsReconcile || state.HasUsers {
+		t.Fatalf("unversioned delta changed seeded baseline: %+v", state)
 	}
 }
 

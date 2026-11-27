@@ -9,53 +9,32 @@ import (
 	"github.com/cedar2025/xboard-node/internal/model"
 )
 
-func mailboxUserIDs(users []model.UserSpec) []int {
-	ids := make([]int, 0, len(users))
-	for _, u := range users {
-		ids = append(ids, u.ID)
-	}
-	return ids
-}
-
-func TestSyncBaselinePreventsResurrection(t *testing.T) {
-	mb := NewNodeMailbox()
-	mb.SeedBaseline([]model.UserSpec{{ID: 1, UUID: "a"}, {ID: 2, UUID: "b"}}, nil)
-
-	// REST reconciliation removes user 2 and the service feeds the
-	// authoritative snapshot back into the mailbox baseline.
-	mb.SyncBaseline([]model.UserSpec{{ID: 1, UUID: "a"}}, nil)
-
-	// A later WS delta adds user 3; the drained full set must be
-	// {1, 3} — user 2 must NOT come back from the stale baseline.
-	mb.Apply(Event{Type: EventSyncUserDelta, DeltaAction: "add", DeltaUsers: []model.UserSpec{{ID: 3, UUID: "c"}}})
-	mb.MarkReady()
-	state := mb.DrainIfReady()
-	if !state.HasUsers {
-		t.Fatal("drain returned no users")
-	}
-	ids := mailboxUserIDs(state.Users)
-	if len(ids) != 2 || ids[0] != 1 || ids[1] != 3 {
-		t.Fatalf("drained user IDs = %v, want [1 3] (user 2 stays removed)", ids)
-	}
-}
-
-func TestSyncBaselineDefersWhileDeltaPending(t *testing.T) {
+func TestSyncBaselinePreservesExplicitEmptySnapshot(t *testing.T) {
 	mb := NewNodeMailbox()
 	mb.SeedBaseline([]model.UserSpec{{ID: 1, UUID: "a"}}, nil)
-
-	// A WS delta lands first and has not drained yet; a REST snapshot
-	// racing it must not clobber the newer delta. Instead the drain
-	// asks for a reconcile so the next snapshot re-orders the sources.
-	mb.Apply(Event{Type: EventSyncUserDelta, DeltaAction: "add", DeltaUsers: []model.UserSpec{{ID: 2, UUID: "b"}}})
-	mb.SyncBaseline([]model.UserSpec{{ID: 9, UUID: "z"}}, nil)
-
-	mb.MarkReady()
-	state := mb.DrainIfReady()
-	if !state.NeedsReconcile {
-		t.Fatal("drain must request a reconcile when a baseline sync was deferred")
+	mb.SyncBaseline(nil, nil)
+	if len(mb.users) != 1 {
+		t.Fatalf("missing snapshot cleared baseline: %v", mb.users)
 	}
-	ids := mailboxUserIDs(state.Users)
-	if len(ids) != 2 || ids[0] != 1 || ids[1] != 2 {
-		t.Fatalf("drained user IDs = %v, want [1 2] (pending delta preserved)", ids)
+	mb.SyncBaseline([]model.UserSpec{}, nil)
+	if !mb.hasFullUserState || mb.users == nil || len(mb.users) != 0 {
+		t.Fatalf("empty snapshot did not replace baseline: %v", mb.users)
+	}
+	mb.MarkReady()
+	mb.Apply(Event{Type: EventSyncUserDelta, DeltaAction: "add", DeltaUsers: []model.UserSpec{{ID: 2, UUID: "b"}}})
+	state := mb.DrainIfReady()
+	if state.HasUsers || !state.NeedsReconcile || len(mb.users) != 0 {
+		t.Fatalf("unversioned delta altered cleared baseline: %+v", state)
+	}
+}
+
+func TestSyncBaselineDefersWhileFullSnapshotPending(t *testing.T) {
+	mb := NewNodeMailbox()
+	mb.MarkReady()
+	mb.Apply(Event{Type: EventSyncUsers, Users: []model.UserSpec{{ID: 2, UUID: "b"}}})
+	mb.SyncBaseline([]model.UserSpec{}, nil)
+	state := mb.DrainIfReady()
+	if !state.NeedsReconcile || !state.HasUsers || len(state.Users) != 1 || state.Users[0].ID != 2 {
+		t.Fatalf("pending full set lost: %+v", state)
 	}
 }

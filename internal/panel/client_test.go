@@ -71,10 +71,12 @@ func TestGetConfig_NotModified(t *testing.T) {
 	defer ts.Close()
 
 	// First call — get config
-	cfg, err := client.GetConfig()
+	var tag string
+	cfg, err := client.GetConfig(&tag)
 	if err != nil || cfg == nil {
 		t.Fatalf("first GetConfig: err=%v cfg=%v", err, cfg)
 	}
+	client.CommitETags(&tag, nil)
 
 	// Second call — should be 304
 	cfg, err = client.GetConfig()
@@ -139,7 +141,9 @@ func TestGetUsers_NotModified(t *testing.T) {
 	})
 	defer ts.Close()
 
-	users, _ := client.GetUsers()
+	var tag string
+	users, _ := client.GetUsers(&tag)
+	client.CommitETags(nil, &tag)
 	if len(users) != 1 {
 		t.Fatalf("first call: got %d users", len(users))
 	}
@@ -244,7 +248,7 @@ func TestResetETags(t *testing.T) {
 	callCount := 0
 	ts, client := newTestServer(func(w http.ResponseWriter, r *http.Request) {
 		callCount++
-		if callCount <= 2 {
+		if callCount == 1 {
 			w.Header().Set("ETag", `"e1"`)
 			json.NewEncoder(w).Encode(NodeConfig{Protocol: "ss"})
 			return
@@ -257,7 +261,9 @@ func TestResetETags(t *testing.T) {
 	})
 	defer ts.Close()
 
-	client.GetConfig()
+	var tag string
+	client.GetConfig(&tag)
+	client.CommitETags(&tag, nil)
 	client.ResetETags()
 	client.GetConfig()
 }

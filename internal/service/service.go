@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -55,10 +56,11 @@ type Service struct {
 	pushInterval int // seconds
 	pullInterval int // seconds
 
-	lastUserHash   string     // hash of user list for change detection
-	lastConfigHash string     // hash of full config for change detection
-	pullBackoff    apiBackoff // backoff for panel pull failures
-	pushBackoff    apiBackoff // backoff for panel push failures
+	lastUserHash     string // hash of user list for change detection
+	configNeedsApply bool
+	lastConfigHash   string     // hash of full config for change detection
+	pullBackoff      apiBackoff // backoff for panel pull failures
+	pushBackoff      apiBackoff // backoff for panel push failures
 
 	// pushActive prevents overlapping push/pull goroutines.
 	pushActive atomic.Bool
@@ -66,14 +68,20 @@ type Service struct {
 	// pullResults delivers async pullViaAPI results back to the main goroutine.
 	pullResults chan pullResult
 
-	wsClient         controlplane.PushClient        // Push client (nil if push is not enabled)
-	wsEvents         chan controlplane.Event        // receives data events from push transport
-	wsStatusCh       chan controlplane.StatusChange // receives push connectivity notifications
-	wsCancel         context.CancelFunc             // cancels the WS client goroutine
-	wsDisconnectAt   time.Time                      // when WS last disconnected (zero if connected)
-	wsResyncPending  atomic.Bool
-	machineMailbox   *controlplane.NodeMailbox
-	machineMailboxCh <-chan struct{}
+	wsClient        controlplane.PushClient        // Push client (nil if push is not enabled)
+	wsEvents        chan controlplane.Event        // receives data events from push transport
+	wsStatusCh      chan controlplane.StatusChange // receives push connectivity notifications
+	wsCancel        context.CancelFunc             // cancels the WS client goroutine
+	wsDisconnectAt  time.Time                      // when WS last disconnected (zero if connected)
+	wsResyncPending bool
+	// Local WS observations are ordered independently for each resource.
+	resyncRevision       uint64
+	configRevision       uint64
+	userRevision         uint64
+	polledConfigRevision uint64
+	polledUserRevision   uint64
+	machineMailbox       *controlplane.NodeMailbox
+	machineMailboxCh     <-chan struct{}
 
 	// metricsMu: lastUsers, lastConfig, wsClient, wsDisconnectAt (buildMetrics vs main loop).
 	metricsMu sync.RWMutex
@@ -91,10 +99,13 @@ type certificateManager interface {
 
 // pullResult carries the outcome of an async pullViaAPI back to the main goroutine.
 type pullResult struct {
-	config     *model.NodeSpec
-	users      []model.UserSpec
-	configHash string
-	userHash   string
+	commit                                       func(bool, bool)
+	configRevision, userRevision, resyncRevision uint64
+	failed                                       bool
+	config                                       *model.NodeSpec
+	users                                        []model.UserSpec
+	configHash                                   string
+	userHash                                     string
 }
 
 // apiBackoff implements simple exponential backoff for API failures.
@@ -231,6 +242,10 @@ func (s *Service) Run(ctx context.Context) error {
 func (s *Service) runEvents(ctx context.Context, trackTicker, reportTicker, pullTicker, deviceReportTicker, wsDiscoveryTicker *time.Ticker) error {
 	renewalTicker := time.NewTicker(time.Second)
 	defer renewalTicker.Stop()
+	defer func() {
+		s.wsResyncPending = false
+		s.pullActive.Store(false)
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -239,6 +254,10 @@ func (s *Service) runEvents(ctx context.Context, trackTicker, reportTicker, pull
 
 		case <-renewalTicker.C:
 			s.applyCertificateRenewal()
+			s.checkWSDrops(ctx)
+			if s.wsResyncPending {
+				s.pullViaAPIAsync(ctx)
+			}
 
 		case <-trackTicker.C:
 			s.trackAndEnforce(ctx)
@@ -259,6 +278,11 @@ func (s *Service) runEvents(ctx context.Context, trackTicker, reportTicker, pull
 			s.pullViaAPIAsync(ctx)
 
 		case result := <-s.pullResults:
+			s.checkWSDrops(ctx)
+			s.drainMachineMailbox(ctx)
+			for queued := len(s.wsEvents); queued > 0; queued-- {
+				s.handleWSEvent(ctx, <-s.wsEvents)
+			}
 			s.applyPullResult(ctx, result)
 
 		case <-wsDiscoveryTicker.C:
@@ -320,32 +344,13 @@ func (s *Service) initialSetup(ctx context.Context) error {
 		}
 		return fmt.Errorf("initial config is nil")
 	}
-	if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), bootstrap.Config, s.cert.TLSCert()); err != nil {
-		return err
-	}
 
-	s.metricsMu.Lock()
-	s.lastConfig = bootstrap.Config
-	s.metricsMu.Unlock()
-	s.lastConfigHash = computeConfigHash(bootstrap.Config)
 	s.updateUserState(bootstrap.Users)
-
-	nlog.Core().Info("initial snapshot ready",
-		"protocol", bootstrap.Config.Protocol,
-		"port", bootstrap.Config.ServerPort,
-		"users", len(bootstrap.Users),
-	)
-
-	if len(bootstrap.Users) == 0 {
-		nlog.Core().Warn("no users, kernel will not start until users are available")
-		s.markMailboxReadyAndDrain(ctx)
-		return nil
+	if !s.applyConfig(ctx, bootstrap.Config, computeConfigHash(bootstrap.Config), nil) {
+		return fmt.Errorf("apply initial configuration")
 	}
-
-	s.applyRemoteOverrides(ctx, bootstrap.Config)
-	if !s.startKernel(bootstrap.Config, bootstrap.Users) {
-		return fmt.Errorf("start kernel")
-	}
+	nlog.Core().Info("initial snapshot ready", "protocol", bootstrap.Config.Protocol,
+		"port", bootstrap.Config.ServerPort, "users", len(bootstrap.Users))
 	s.markMailboxReadyAndDrain(ctx)
 	return nil
 }
@@ -446,18 +451,27 @@ func (s *Service) drainMachineMailbox(ctx context.Context) {
 		s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncDevices, DeviceUsers: state.DeviceUsers})
 	}
 	if state.NeedsReconcile {
+		s.userRevision++
 		s.requestWSResync(ctx, "machine_mailbox_reconcile")
 	}
 }
 
+func (s *Service) checkWSDrops(ctx context.Context) {
+	if push, ok := s.wsClient.(interface{ TakeDroppedEvents() bool }); ok && push.TakeDroppedEvents() {
+		s.configRevision++
+		s.userRevision++
+		s.requestWSResync(ctx, "drop_detected")
+	}
+}
+
 func (s *Service) requestWSResync(ctx context.Context, reason string) {
-	if !s.wsResyncPending.CompareAndSwap(false, true) {
+	if ctx.Err() != nil || !s.source.SupportsPolling() {
 		return
 	}
-	if s.nodeLog != nil {
-		s.nodeLog.Warn("ws state may be stale, scheduling REST reconciliation", "reason", reason)
-	} else {
+	s.resyncRevision++
+	if !s.wsResyncPending {
 		nlog.Core().Warn("ws state may be stale, scheduling REST reconciliation", "reason", reason)
+		s.wsResyncPending = true
 	}
 	s.pullViaAPIAsync(ctx)
 }
@@ -489,7 +503,7 @@ func (s *Service) handleWSStatus(ctx context.Context, status controlplane.Status
 		}
 		// After reconnect, proactively pull once to ensure we haven't missed
 		// any updates during the disconnection window.
-		s.pullViaAPIAsync(ctx)
+		s.requestWSResync(ctx, "ws_connected")
 	} else {
 		s.metricsMu.Lock()
 		if s.wsDisconnectAt.IsZero() {
@@ -571,47 +585,29 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		if event.Config == nil {
 			return
 		}
-		newConfigHash := computeConfigHash(event.Config)
-		if newConfigHash == s.lastConfigHash {
-			return
+		s.configRevision++
+		if !s.applyConfig(ctx, event.Config, computeConfigHash(event.Config), nil) {
+			s.requestWSResync(ctx, "config_apply_failed")
 		}
-		if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), event.Config, s.cert.TLSCert()); err != nil {
-			nlog.Core().Warn("ws config validation failed, ignoring update", "error", err)
-			return
-		}
-		// Initialize nodeLog on first config
-		if s.nodeLog == nil {
-			s.nodeLog = nlog.ForNode(event.Config.Protocol, event.Config.ServerPort)
-		}
-		s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(event.Users)))
-		s.metricsMu.Lock()
-		s.lastConfig = event.Config
-		s.metricsMu.Unlock()
-		s.lastConfigHash = newConfigHash
-		s.applyRemoteOverrides(ctx, event.Config)
-		s.applyChanges(ctx, true, false)
 
 	case controlplane.EventSyncUsers:
 		if event.Users == nil {
+			s.requestWSResync(ctx, "missing_user_snapshot")
 			return
 		}
-		newHash := computeUserHash(event.Users)
-		if newHash == s.lastUserHash {
-			return
+		s.userRevision++
+		hash := computeUserHash(event.Users)
+		if hash != s.lastUserHash {
+			s.applyUserUpdate(ctx, event.Users, hash)
+			if hash != s.lastUserHash {
+				s.requestWSResync(ctx, "users_apply_failed")
+			}
 		}
-		if s.nodeLog != nil {
-			s.nodeLog.Info(fmt.Sprintf("users updated, %d users", len(event.Users)))
-		}
-		s.applyUserUpdate(ctx, event.Users, newHash)
 
 	case controlplane.EventSyncUserDelta:
-		if len(event.DeltaUsers) == 0 {
-			return
-		}
-		if s.nodeLog != nil {
-			s.nodeLog.Info(fmt.Sprintf("users delta: %s, %d users", event.DeltaAction, len(event.DeltaUsers)))
-		}
-		s.applyUserDelta(ctx, event.DeltaAction, event.DeltaUsers)
+		// The legacy wire event has no base revision. Reconcile with a full set.
+		s.userRevision++
+		s.requestWSResync(ctx, "unversioned_user_delta")
 
 	case controlplane.EventSyncDevices:
 		// Sync global device state
@@ -627,7 +623,7 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 // pullViaAPIAsync fetches config/users from the panel API in a background
 // goroutine and sends the result to pullResults for the main goroutine to apply.
 func (s *Service) pullViaAPIAsync(ctx context.Context) {
-	if !s.source.SupportsPolling() {
+	if ctx.Err() != nil || !s.source.SupportsPolling() {
 		return
 	}
 	if !s.pullActive.CompareAndSwap(false, true) {
@@ -640,96 +636,93 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 		return
 	}
 
-	currentConfigHash := s.lastConfigHash
-
+	result := pullResult{
+		configRevision: s.configRevision, userRevision: s.userRevision,
+		resyncRevision: s.resyncRevision,
+	}
+	pollCtx := ctx
+	if s.wsResyncPending || s.configRevision != s.polledConfigRevision || s.userRevision != s.polledUserRevision {
+		pollCtx = controlplane.FullPoll(ctx)
+	}
 	go func() {
-		defer s.pullActive.Store(false)
-		snapshot, err := s.source.Poll(ctx)
+		snapshot, err := s.source.Poll(pollCtx)
 		if err != nil {
 			nlog.Core().Error("poll control plane failed", "error", err)
 			s.pullBackoff.onFailure()
-			return
-		}
-		s.pullBackoff.onSuccess()
-
-		result := pullResult{}
-		if snapshot.Config != nil {
-			result.config = snapshot.Config
-			result.configHash = computeConfigHash(snapshot.Config)
-			if result.configHash == currentConfigHash {
-				result.config = nil
+			result.failed = true
+		} else {
+			s.pullBackoff.onSuccess()
+			result.config, result.users, result.commit = snapshot.Config, snapshot.Users, snapshot.Commit
+			if result.config != nil {
+				result.configHash = computeConfigHash(result.config)
+			}
+			if result.users != nil {
+				result.userHash = computeUserHash(result.users)
 			}
 		}
-		if snapshot.Users != nil {
-			result.users = snapshot.Users
-			result.userHash = computeUserHash(snapshot.Users)
-		}
-
 		select {
 		case s.pullResults <- result:
 		case <-ctx.Done():
+			s.pullActive.Store(false)
 		}
 	}()
 }
 
-// applyPullResult processes the result of an async pullViaAPI on the main goroutine.
+// applyPullResult rechecks both local revision domains at the commit point.
 func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
-	s.wsResyncPending.Store(false)
-	configChanged := false
-
-	if result.config != nil {
-		if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), result.config, s.cert.TLSCert()); err != nil {
-			nlog.Core().Warn("runtime config validation failed", "error", err)
-			result.config = nil
-		} else {
-			configChanged = true
-			// Initialize or update node logger
-			if s.nodeLog == nil {
-				s.nodeLog = nlog.ForNode(result.config.Protocol, result.config.ServerPort)
-			}
-			s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(s.lastUsers)))
-			s.metricsMu.Lock()
-			s.lastConfig = result.config
-			s.metricsMu.Unlock()
-			s.lastConfigHash = result.configHash
-			if s.applyRemoteOverrides(ctx, result.config) {
-				configChanged = true
-			}
-		}
+	defer s.pullActive.Store(false)
+	if result.failed || ctx.Err() != nil {
+		return
 	}
 
-	if result.users != nil {
-		usersChanged := result.userHash != s.lastUserHash
-
-		if usersChanged && !configChanged {
+	configCurrent := result.configRevision == s.configRevision
+	usersCurrent := result.userRevision == s.userRevision
+	configApplied, usersApplied := configCurrent, usersCurrent
+	usersChanged := usersCurrent && result.users != nil && result.userHash != s.lastUserHash
+	configChanged := configCurrent && result.config != nil && (result.configHash != s.lastConfigHash || s.configNeedsApply)
+	if configChanged && usersChanged && len(result.users) != 0 {
+		// Restart or reload the candidate config with its matching authorization set.
+		configApplied = s.applyConfig(ctx, result.config, result.configHash, result.users)
+		usersApplied = configApplied
+		if !configApplied && s.kernel.IsRunning() {
+			// Config validation can fail while the previous listener is still serving.
 			s.applyUserUpdate(ctx, result.users, result.userHash)
-		} else if usersChanged {
-			s.updateUserState(result.users)
+			usersApplied = result.userHash == s.lastUserHash
+		}
+	} else {
+		if usersChanged {
+			s.applyUserUpdate(ctx, result.users, result.userHash)
+			usersApplied = result.userHash == s.lastUserHash
+		}
+		if configChanged {
+			configApplied = s.applyConfig(ctx, result.config, result.configHash, nil)
 		}
 	}
-
-	// NODE-011: a REST snapshot is authoritative for the mailbox
-	// baseline too. Without this, the mailbox kept merging WS deltas
-	// into its startup baseline and a later drain wrote users back
-	// that this snapshot had just removed.
-	if s.machineMailbox != nil && (result.users != nil || result.config != nil) {
-		s.metricsMu.RLock()
-		appliedUsers := s.lastUsers
-		appliedConfig := s.lastConfig
-		s.metricsMu.RUnlock()
-		var syncUsers []model.UserSpec
-		if result.users != nil {
-			syncUsers = appliedUsers
-		}
-		var syncConfig *model.NodeSpec
-		if result.config != nil {
-			syncConfig = appliedConfig
-		}
-		s.machineMailbox.SyncBaseline(syncUsers, syncConfig)
+	if result.commit != nil {
+		result.commit(configApplied, usersApplied)
+	}
+	if configApplied {
+		s.polledConfigRevision = result.configRevision
+	}
+	if usersApplied {
+		s.polledUserRevision = result.userRevision
 	}
 
-	if configChanged {
-		s.applyChanges(ctx, true, false)
+	if s.machineMailbox != nil {
+		var users []model.UserSpec
+		var cfg *model.NodeSpec
+		if usersApplied && result.users != nil {
+			users = s.lastUsers
+		}
+		if configApplied && result.config != nil {
+			cfg = s.lastConfig
+		}
+		s.machineMailbox.SyncBaseline(users, cfg)
+	}
+	if configApplied && usersApplied && result.resyncRevision == s.resyncRevision {
+		s.wsResyncPending = false
+	} else if !configApplied || !usersApplied {
+		s.wsResyncPending = true
 	}
 }
 
@@ -748,7 +741,7 @@ func (s *Service) prepareUserState(users []model.UserSpec) (prevUsers []model.Us
 	}
 
 	s.metricsMu.RLock()
-	prevUsers = append([]model.UserSpec(nil), s.lastUsers...)
+	prevUsers = slices.Clone(s.lastUsers)
 	s.metricsMu.RUnlock()
 	prevHash = s.lastUserHash
 
@@ -756,20 +749,17 @@ func (s *Service) prepareUserState(users []model.UserSpec) (prevUsers []model.Us
 	s.speedTracker.UpdateBuckets()
 
 	s.metricsMu.Lock()
-	s.lastUsers = append([]model.UserSpec(nil), users...)
+	s.lastUsers = append([]model.UserSpec{}, users...)
 	s.metricsMu.Unlock()
 	s.lastUserHash = computeUserHash(users)
 	return prevUsers, prevHash
 }
 
 func (s *Service) restoreUserState(users []model.UserSpec, hash string) {
-	if users == nil {
-		users = []model.UserSpec{}
-	}
 	s.limiter.UpdateUsers(users)
 	s.speedTracker.UpdateBuckets()
 	s.metricsMu.Lock()
-	s.lastUsers = append([]model.UserSpec(nil), users...)
+	s.lastUsers = slices.Clone(users)
 	s.metricsMu.Unlock()
 	s.lastUserHash = hash
 }
@@ -1017,37 +1007,51 @@ func subtractUsers(base, delta []model.UserSpec) []model.UserSpec {
 	return out
 }
 
-// applyChanges applies config changes to the kernel. User-only changes are
-// handled by applyUserUpdate/applyUserDelta directly via the atomic user API.
-func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged bool) {
-	if !configChanged {
-		return
+// applyConfig publishes the config and hash only after kernel confirmation.
+func (s *Service) applyConfig(ctx context.Context, candidate *model.NodeSpec, hash string, users []model.UserSpec) bool {
+	if hash == s.lastConfigHash && !s.configNeedsApply {
+		return true
 	}
-
-	if s.lastConfig == nil || len(s.lastUsers) == 0 {
-		if len(s.lastUsers) == 0 {
-			s.kernel.Stop()
-			s.appliedState.Users = nil
-		}
-		return
+	if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), candidate, s.cert.TLSCert()); err != nil {
+		nlog.Core().Warn("runtime config validation failed", "error", err)
+		return false
 	}
-
-	// If config changed, delegate to kernel.Reload. The kernel implementation
-	// decides whether to hot-swap users, reconstruct inbounds, or restart itself.
-	if configChanged && s.kernel.IsRunning() {
-		if err := s.kernel.Reload(s.lastConfig, s.lastUsers, s.cert.TLSCert()); err != nil {
-			nlog.Core().Warn(fmt.Sprintf("reload failed, restarting: %v", err))
-			s.startKernel(s.lastConfig, s.lastUsers)
-		} else {
-			s.appliedState.Config = s.lastConfig
-			s.appliedState.Users = s.lastUsers
-			if s.nodeLog != nil {
-				s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(s.lastUsers)))
+	var previousUsers []model.UserSpec
+	var previousUserHash string
+	if users != nil {
+		previousUsers, previousUserHash = s.prepareUserState(users)
+	}
+	s.applyRemoteOverrides(ctx, candidate)
+	if len(s.lastUsers) == 0 {
+		s.kernel.Stop()
+		s.appliedState.Users = nil
+	} else {
+		reloaded := false
+		if s.kernel.IsRunning() {
+			if err := s.kernel.Reload(candidate, s.lastUsers, s.cert.TLSCert()); err != nil {
+				nlog.Core().Warn("reload failed, restarting", "error", err)
+				// A partial Reload may already have removed the previous inbound.
+				s.kernel.Stop()
+			} else {
+				reloaded = true
 			}
 		}
-	} else if !s.kernel.IsRunning() {
-		s.startKernel(s.lastConfig, s.lastUsers)
+		if !reloaded && !s.startKernel(candidate, s.lastUsers) {
+			s.configNeedsApply = true
+			if users != nil {
+				s.restoreUserState(previousUsers, previousUserHash)
+			}
+			return false
+		}
+		s.appliedState.Users = s.lastUsers
 	}
+	s.appliedState.Config = candidate
+	s.metricsMu.Lock()
+	s.lastConfig = candidate
+	s.metricsMu.Unlock()
+	s.lastConfigHash = hash
+	s.configNeedsApply = false
+	return true
 }
 
 func (s *Service) trackAndEnforce(ctx context.Context) {
