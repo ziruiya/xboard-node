@@ -66,6 +66,7 @@ type TrafficBatchMeta struct {
 }
 
 type ReportPayload struct {
+	Context context.Context
 	Traffic map[int][2]int64
 	// TrafficBatch describes Traffic: the batch id and the collection
 	// window. Old panels ignore the envelope and keep using the

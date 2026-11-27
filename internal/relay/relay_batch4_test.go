@@ -84,7 +84,7 @@ func TestFlushNeverEmitsNegativeBatch(t *testing.T) {
 		Reported: map[string]counters{"RL000001": {In: 150}},
 		NextSeq:  map[string]int64{},
 	}
-	m.flushTraffic() // nil client: must not be reached with any batch
+	m.flushTrafficContext(context.Background()) // nil client: must not be reached with any batch
 
 	if len(m.state.Pending) != 0 {
 		t.Fatalf("Pending = %+v, want no (negative) batch created", m.state.Pending)
@@ -241,7 +241,7 @@ func TestConcurrentFlushesLoseNothing(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			m.flushTraffic()
+			m.flushTrafficContext(context.Background())
 		}()
 	}
 	wg.Wait()

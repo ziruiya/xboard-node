@@ -276,3 +276,32 @@ func TestXrayRemoveUsersStopsKernelWhenLastUserRemoved(t *testing.T) {
 		t.Fatal("expected xray to stop when last user is removed")
 	}
 }
+
+func TestBatch2BXrayRetiresIndependentStats(t *testing.T) {
+	users := []model.UserSpec{{ID: 1}}
+	x, old := newStatsBackedXray(t, users, nil)
+	next, current := newStatsBackedXray(t, users, nil)
+	uplink := counterName(1, "uplink")
+	oldBytes := mustRegisterCounter(t, old, uplink)
+	currentBytes := mustRegisterCounter(t, current, uplink)
+	oldBytes.Add(10)
+	read := func(want int64) {
+		t.Helper()
+		traffic, _, _, err := x.GetUserTraffic(context.Background())
+		if err != nil || traffic[1][0] != want {
+			t.Fatalf("cumulative traffic = %v, err=%v; want %d bytes", traffic, err, want)
+		}
+	}
+	read(10)
+	previous := x.instance
+	x.instance = next.instance
+	currentBytes.Add(25)
+	read(35)
+	oldBytes.Add(7)
+	x.retireInstance(previous, nil, users, 0, nil)
+	read(42)
+	currentBytes.Add(8)
+	x.Stop()
+	read(50)
+	read(50)
+}

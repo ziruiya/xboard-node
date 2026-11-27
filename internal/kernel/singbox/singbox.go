@@ -39,6 +39,9 @@ type SingBox struct {
 
 	platform adapter.PlatformInterface
 
+	// Serialize instance installs against Stop joining retiring instances.
+	lifecycleMu sync.Mutex
+
 	mu     sync.RWMutex
 	box    *box.Box
 	ctx    context.Context
@@ -62,6 +65,8 @@ type SingBox struct {
 	deviceLimitFunc func(string) (int, bool)
 
 	retiredTrackers map[*ConnTracker]map[string]int
+	retiring        sync.WaitGroup
+	retiredTraffic  map[int][2]int64 // folded once when a generation exits
 }
 
 func New(cfg config.KernelConfig) *SingBox {
@@ -91,6 +96,8 @@ func (s *SingBox) Protocols() []string {
 }
 
 func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -176,12 +183,12 @@ func (s *SingBox) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec
 			s.retiredTrackers[oldTracker] = buildUserMap(oldUsers)
 			s.updateTrackerUsersLocked(users)
 		}
-		go func() {
+		s.retiring.Go(func() {
 			recycleOldBox(oldBox, oldCancel, oldCtx, oldTracker)
 			s.mu.Lock()
-			delete(s.retiredTrackers, oldTracker)
+			s.settleTrackerLocked(oldTracker)
 			s.mu.Unlock()
-		}()
+		})
 	}
 
 	nlog.Core().Debug("sing-box started", "users", len(users))
@@ -219,6 +226,8 @@ func recycleOldBox(oldBox *box.Box, oldCancel context.CancelFunc, oldCtx context
 // Reload updates routing and inbounds in place when outbounds are unchanged.
 // An outbound change requires a replacement instance.
 func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -367,9 +376,12 @@ func (s *SingBox) updateTrackerUsersLocked(users []model.UserSpec) {
 }
 
 func (s *SingBox) Stop() {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.stop()
+	s.mu.Unlock()
+	s.retiring.Wait()
 }
 
 func (s *SingBox) stop() {
@@ -408,6 +420,8 @@ func (s *SingBox) stop() {
 		s.cancel = nil
 	}
 	s.ctx = nil
+	s.settleTrackerLocked(s.connTracker)
+	s.connTracker = nil
 }
 
 func (s *SingBox) IsRunning() bool {
@@ -673,12 +687,37 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 
 // ─── Observability ──────────────────────────────────────────────────────────
 func (s *SingBox) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error) {
-	ct := s.connTrackerSafe()
-	if ct == nil {
-		return nil, nil, 0, nil
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	traffic = make(map[int][2]int64, len(s.retiredTraffic))
+	addTraffic(traffic, s.retiredTraffic)
+	if s.connTracker != nil {
+		var current map[int][2]int64
+		current, aliveIPs, connCount = s.connTracker.GetUserTraffic()
+		addTraffic(traffic, current)
 	}
-	traffic, aliveIPs, connCount = ct.GetUserTraffic()
+	for ct := range s.retiredTrackers {
+		addTraffic(traffic, ct.trafficTotals())
+	}
 	return traffic, aliveIPs, connCount, nil
+}
+
+func (s *SingBox) settleTrackerLocked(ct *ConnTracker) {
+	if ct == nil {
+		return
+	}
+	if s.retiredTraffic == nil {
+		s.retiredTraffic = make(map[int][2]int64)
+	}
+	addTraffic(s.retiredTraffic, ct.trafficTotals())
+	delete(s.retiredTrackers, ct)
+}
+
+func addTraffic(total, current map[int][2]int64) {
+	for uid, count := range current {
+		prev := total[uid]
+		total[uid] = [2]int64{prev[0] + count[0], prev[1] + count[1]}
+	}
 }
 
 // CloseConnection force-closes a specific connection by its ID.

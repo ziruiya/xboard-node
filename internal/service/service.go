@@ -62,9 +62,10 @@ type Service struct {
 	pullBackoff      apiBackoff // backoff for panel pull failures
 	pushBackoff      apiBackoff // backoff for panel push failures
 
-	// pushActive prevents overlapping push/pull goroutines.
-	pushActive atomic.Bool
-	pullActive atomic.Bool
+	// pushDone is owned by the event loop. The sender closes it after committing its result.
+	pushDone        chan struct{}
+	restDevicesHash string
+	pullActive      atomic.Bool
 	// pullResults delivers async pullViaAPI results back to the main goroutine.
 	pullResults chan pullResult
 
@@ -214,7 +215,6 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.initialSetup(ctx); err != nil {
 		return fmt.Errorf("initial setup: %w", err)
 	}
-	defer s.kernel.Stop()
 
 	// Set up tickers
 	trackTicker := time.NewTicker(time.Duration(s.cfg.Node.TrackInterval) * time.Second)
@@ -263,7 +263,7 @@ func (s *Service) runEvents(ctx context.Context, trackTicker, reportTicker, pull
 			s.trackAndEnforce(ctx)
 
 		case <-reportTicker.C:
-			s.pushReportAsync()
+			s.pushReportAsync(ctx)
 
 		case <-deviceReportTicker.C:
 			s.reportDevices()
@@ -501,6 +501,7 @@ func (s *Service) handleWSStatus(ctx context.Context, status controlplane.Status
 		} else {
 			nlog.Core().Info("ws connected")
 		}
+		s.sendDeviceBatch()
 		// After reconnect, proactively pull once to ensure we haven't missed
 		// any updates during the disconnection window.
 		s.requestWSResync(ctx, "ws_connected")
@@ -1055,10 +1056,6 @@ func (s *Service) applyConfig(ctx context.Context, candidate *model.NodeSpec, ha
 }
 
 func (s *Service) trackAndEnforce(ctx context.Context) {
-	if !s.kernel.IsRunning() {
-		return
-	}
-
 	traffic, aliveIPs, connCount, err := s.kernel.GetUserTraffic(ctx)
 	if err != nil {
 		nlog.Core().Debug("get user traffic failed", "error", err)
@@ -1077,103 +1074,103 @@ func (s *Service) trackAndEnforce(ctx context.Context) {
 	}
 }
 
-// pushReportAsync sends the report in a background goroutine so the select
-// loop is never blocked by slow HTTP. Only one push runs at a time.
-func (s *Service) pushReportAsync() {
+// pushReportAsync keeps slow HTTP off the event loop and starts at most one sender.
+func (s *Service) pushReportAsync(ctx context.Context) {
 	if !s.sink.SupportsReporting() {
 		return
 	}
-	if !s.pushActive.CompareAndSwap(false, true) {
-		nlog.Core().Debug("push already in progress, skipping")
-		return
-	}
-	if s.pushBackoff.shouldSkip() {
-		nlog.Core().Debug("skipping report due to backoff")
-		s.pushActive.Store(false)
-		return
-	}
-
-	// SB-TA-001/002: an unacknowledged batch is re-sent verbatim
-	// (same ID, same content); new samples keep accumulating into the
-	// next batch and are never merged into it. Only when no batch is
-	// outstanding do we flush a fresh one.
-	batch := s.tracker.Unacked()
-	if batch == nil {
-		batch = s.tracker.FlushBatch()
-		if batch != nil {
-			s.tracker.SetUnacked(batch)
+	if s.pushDone != nil {
+		select {
+		case <-s.pushDone:
+		default:
+			return
 		}
 	}
-	var traffic map[int][2]int64
-	var batchMeta *controlplane.TrafficBatchMeta
-	if batch != nil {
-		traffic = batch.Data
-		batchMeta = &controlplane.TrafficBatchMeta{BatchID: batch.ID, CollectedFrom: batch.CollectedFrom, CollectedTo: batch.CollectedTo}
-	} else {
-		traffic = make(map[int][2]int64)
+	if s.pushBackoff.shouldSkip() {
+		return
 	}
-	aliveIPs := s.tracker.FlushAliveIPs()
-	online := s.tracker.CurrentOnline()
-	status := monitor.Collect()
-	metrics := s.buildMetrics(status)
-	metrics["kernel_status"] = s.kernel.IsRunning()
-
+	done := make(chan struct{})
+	s.pushDone = done
 	go func() {
-		defer s.pushActive.Store(false)
-		if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, TrafficBatch: batchMeta, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
-			nlog.Core().Warn("failed to push report", "error", err)
-			// The batch stays unacknowledged and will be re-sent
-			// verbatim on the next push; do NOT merge it back into
-			// the pending accumulator (that was the TA-001 defect).
-			if len(aliveIPs) > 0 {
-				s.tracker.RestoreAliveIPs(aliveIPs)
-			}
+		defer close(done)
+		if !s.queueReports() {
+			return
+		}
+		if !s.sendReports(ctx) {
 			s.pushBackoff.onFailure()
 			return
 		}
-		if batch != nil {
-			s.tracker.AckBatch(batch.ID)
-		}
 		s.pushBackoff.onSuccess()
-		nlog.ReportPushed(len(traffic), len(online))
 	}()
 }
 
-// pushReportSync is used only during shutdown to ensure final data is sent.
+// pushReportSync joins the sender, settles the stopped kernel, and saves all
+// outstanding windows before attempting delivery in order.
 func (s *Service) pushReportSync() {
+	if s.pushDone != nil {
+		<-s.pushDone
+	}
 	if !s.sink.SupportsReporting() {
+		s.kernel.Stop()
 		return
 	}
-	// Same batch discipline as the async path: an outstanding batch is
-	// re-sent verbatim; otherwise flush whatever is still pending.
+	// Sample before Stop for kernels that release live state, then sample
+	// again to include traffic accounted for during Stop and retirement.
+	s.trackAndEnforce(context.Background())
+	s.kernel.Stop()
+	s.trackAndEnforce(context.Background())
+	if !s.queueReports() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s.sendReports(ctx)
+}
+
+func (s *Service) queueReports() bool {
+	if err := s.tracker.QueuePending(); err != nil {
+		nlog.Core().Error("failed to persist traffic queue", "error", err)
+		return false
+	}
+	return true
+}
+
+func (s *Service) sendReports(ctx context.Context) bool {
 	batch := s.tracker.Unacked()
 	if batch == nil {
-		batch = s.tracker.FlushBatch()
-		if batch != nil {
-			s.tracker.SetUnacked(batch)
-		}
+		return s.sendReport(ctx, nil)
 	}
+	for batch != nil && ctx.Err() == nil {
+		if !s.sendReport(ctx, batch) {
+			return false
+		}
+		batch = s.tracker.Unacked()
+	}
+	return ctx.Err() == nil
+}
+
+func (s *Service) sendReport(ctx context.Context, batch *tracker.Batch) bool {
 	var traffic map[int][2]int64
 	var batchMeta *controlplane.TrafficBatchMeta
 	if batch != nil {
 		traffic = batch.Data
 		batchMeta = &controlplane.TrafficBatchMeta{BatchID: batch.ID, CollectedFrom: batch.CollectedFrom, CollectedTo: batch.CollectedTo}
-	} else {
-		traffic = make(map[int][2]int64)
 	}
-	aliveIPs := s.tracker.FlushAliveIPs()
+	aliveIPs, hash := s.tracker.AliveIPs()
+	if hash == s.restDevicesHash {
+		aliveIPs = nil
+	}
 	online := s.tracker.CurrentOnline()
 	status := monitor.Collect()
 	metrics := s.buildMetrics(status)
 	metrics["kernel_status"] = s.kernel.IsRunning()
-
-	if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, TrafficBatch: batchMeta, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
-		nlog.Core().Warn("failed to push final report", "error", err)
-		return
+	if err := s.sink.Report(controlplane.ReportPayload{Context: ctx, Traffic: traffic, TrafficBatch: batchMeta, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
+		nlog.Core().Warn("failed to push report", "error", err)
+		return false
 	}
-	if batch != nil {
-		s.tracker.AckBatch(batch.ID)
-	}
+	s.restDevicesHash = hash
+	nlog.ReportPushed(len(traffic), len(online))
+	return batch == nil || s.tracker.AckBatch(batch.ID)
 }
 
 // buildMetrics aggregates node-level metrics to be reported to the panel.
@@ -1289,18 +1286,11 @@ func computeUserHash(users []model.UserSpec) string {
 
 // sendDeviceBatch reports local device snapshot to panel via WS.
 func (s *Service) sendDeviceBatch() {
-	if s.wsClient == nil || !s.wsClient.IsConnected() {
+	if s.wsClient == nil {
 		return
 	}
-
-	devices := s.tracker.FlushAliveIPs()
-	// FlushAliveIPs returns nil if no changes since last flush
-	if devices == nil {
-		nlog.Core().Debug("device snapshot unchanged, skipping")
-		return
-	}
+	devices, _ := s.tracker.AliveIPs()
 	s.sink.ReportDevices(s.wsClient, devices)
-	nlog.Core().Debug("device snapshot sent", "users", len(devices))
 }
 
 // reportDevices periodically reports device snapshot to panel.

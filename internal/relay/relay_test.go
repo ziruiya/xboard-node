@@ -739,7 +739,7 @@ func TestManagerEndToEnd(t *testing.T) {
 	}
 
 	// Traffic: flush and check the mock panel booked the bytes.
-	m.flushTraffic()
+	m.flushTrafficContext(context.Background())
 	in, out, conns := mp.totals()
 	// in: 11 (tcp) + 8 (udp); out adds the 2-byte echo prefixes.
 	if in != wantIn {
@@ -752,7 +752,7 @@ func TestManagerEndToEnd(t *testing.T) {
 		t.Fatalf("booked connections = %d, want >= 1", conns)
 	}
 	// Second flush: no new deltas, totals unchanged.
-	m.flushTraffic()
+	m.flushTrafficContext(context.Background())
 	in2, out2, _ := mp.totals()
 	if in2 != in || out2 != out {
 		t.Fatalf("second flush changed totals: %d/%d -> %d/%d", in, out, in2, out2)
@@ -826,7 +826,7 @@ func TestManagerEndToEnd(t *testing.T) {
 		t.Fatalf("v3 ack = %v, want applied v3", ack)
 	}
 	// Final traffic flush must not error and books the drain-period bytes.
-	m.flushTraffic()
+	m.flushTrafficContext(context.Background())
 	in3, _, _ := mp.totals()
 	if in3 <= in {
 		t.Fatalf("drain-period traffic not booked: in %d -> %d", in, in3)

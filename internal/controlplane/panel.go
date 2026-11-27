@@ -125,7 +125,7 @@ func (p *PanelControlPlane) Discover(ctx context.Context, metricsFn func() map[s
 }
 
 func (p *PanelControlPlane) Report(payload ReportPayload) error {
-	return p.client.Report(payload.Traffic, payload.Alive, payload.Online, payload.CPU, payload.Mem, payload.Swap, payload.Disk, payload.Metrics, toPanelBatchMeta(payload.TrafficBatch))
+	return p.client.ReportContext(payload.Context, payload.Traffic, payload.Alive, payload.Online, payload.CPU, payload.Mem, payload.Swap, payload.Disk, payload.Metrics, toPanelBatchMeta(payload.TrafficBatch))
 }
 
 // toPanelBatchMeta converts the controlplane envelope to the panel

@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -106,8 +107,10 @@ type WSClient struct {
 
 	cfg WSClientConfig
 
-	sessionMu sync.Mutex
-	session   chan wsMessage // non-nil only for a live session
+	sessionMu       sync.Mutex
+	session         chan wsMessage // non-nil only for a live session
+	deviceSnapshots map[int]json.RawMessage
+	deviceWake      chan struct{}
 }
 
 // NewWSClient creates a new WebSocket client.
@@ -128,13 +131,15 @@ func NewWSClient(wsURL string, token string, nodeID int, cfg WSClientConfig, onE
 		cfg.BackoffMax = 60 * time.Second
 	}
 	return &WSClient{
-		wsURL:    wsURL,
-		token:    token,
-		nodeID:   nodeID,
-		cfg:      cfg,
-		onEvent:  onEvent,
-		onStatus: onStatus,
-		onPing:   onPing,
+		wsURL:           wsURL,
+		token:           token,
+		nodeID:          nodeID,
+		cfg:             cfg,
+		onEvent:         onEvent,
+		onStatus:        onStatus,
+		onPing:          onPing,
+		deviceSnapshots: make(map[int]json.RawMessage),
+		deviceWake:      make(chan struct{}, 1),
 	}
 }
 
@@ -265,6 +270,7 @@ func (w *WSClient) serveConnection(ctx context.Context, conn *websocket.Conn, re
 	writeCh := make(chan wsMessage, 16)
 	w.sessionMu.Lock()
 	w.session = writeCh
+	w.wakeDevicesLocked()
 	w.sessionMu.Unlock()
 	w.notifyStatus(true)
 	w.handleMessage(firstMsg)
@@ -308,6 +314,8 @@ func (w *WSClient) serveConnection(ctx context.Context, conn *websocket.Conn, re
 		<-done
 	}()
 
+	// This cursor belongs to this connection and advances only after WriteJSON.
+	sentDevices := make(map[int]json.RawMessage)
 	for {
 		select {
 		case <-ctx.Done():
@@ -333,6 +341,14 @@ func (w *WSClient) serveConnection(ctx context.Context, conn *websocket.Conn, re
 				default:
 					nlog.Core().Warn("ws write channel full, skipping status push (network slow?)")
 				}
+			}
+
+		case <-w.deviceWake:
+			if err := w.writeDeviceSnapshots(sentDevices, func(msg wsMessage) error {
+				conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				return conn.WriteJSON(msg)
+			}); err != nil {
+				return fmt.Errorf("write device snapshot: %w", err)
 			}
 
 		case msg := <-writeCh:
@@ -496,28 +512,60 @@ func (w *WSClient) SendDeviceReport(devices map[int][]string) {
 // SendDeviceReportForNode sends a device report tagged with a specific node_id.
 // nodeID == 0 omits the field (legacy single-node mode).
 func (w *WSClient) SendDeviceReportForNode(nodeID int, devices map[int][]string) {
-	if !w.IsConnected() {
-		return
+	if devices == nil {
+		devices = map[int][]string{}
 	}
-
-	var payload interface{}
+	var payload interface{} = devices
 	if nodeID > 0 {
 		payload = map[string]interface{}{"node_id": nodeID, "devices": devices}
-	} else {
-		payload = devices
 	}
-
-	d, err := json.Marshal(payload)
+	data, err := json.Marshal(payload)
 	if err != nil {
 		return
 	}
-	msg := wsMessage{
-		Event:     WSEventReportDevices,
-		Data:      d,
-		Timestamp: time.Now().Unix(),
+	w.sessionMu.Lock()
+	defer w.sessionMu.Unlock()
+	if !bytes.Equal(w.deviceSnapshots[nodeID], data) {
+		w.deviceSnapshots[nodeID] = data
+		w.wakeDevicesLocked()
 	}
+}
 
-	w.enqueue(msg)
+func (w *WSClient) ForgetDeviceReportForNode(nodeID int) {
+	w.sessionMu.Lock()
+	defer w.sessionMu.Unlock()
+	delete(w.deviceSnapshots, nodeID)
+	w.wakeDevicesLocked()
+}
+
+func (w *WSClient) wakeDevicesLocked() {
+	select {
+	case w.deviceWake <- struct{}{}:
+	default:
+	}
+}
+
+func (w *WSClient) writeDeviceSnapshots(sent map[int]json.RawMessage, write func(wsMessage) error) error {
+	w.sessionMu.Lock()
+	for nodeID := range sent {
+		if _, exists := w.deviceSnapshots[nodeID]; !exists {
+			delete(sent, nodeID)
+		}
+	}
+	pending := make(map[int]json.RawMessage)
+	for nodeID, data := range w.deviceSnapshots {
+		if !bytes.Equal(sent[nodeID], data) {
+			pending[nodeID] = data
+		}
+	}
+	w.sessionMu.Unlock()
+	for nodeID, data := range pending {
+		if err := write(wsMessage{Event: WSEventReportDevices, Data: data, Timestamp: time.Now().Unix()}); err != nil {
+			return err
+		}
+		sent[nodeID] = data
+	}
+	return nil
 }
 
 // SendNodeStatus sends a node.status event with the given node_id (machine mode).

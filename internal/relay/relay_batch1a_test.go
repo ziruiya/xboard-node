@@ -16,11 +16,11 @@ type batch1aACKObserver struct {
 	onApplied func()
 }
 
-func (p batch1aACKObserver) PostRelayAck(version int, hash string, applied bool, errText string) error {
+func (p batch1aACKObserver) PostRelayAckContext(ctx context.Context, version int, hash string, applied bool, errText string) error {
 	if applied {
 		p.onApplied()
 	}
-	return p.batch5Panel.PostRelayAck(version, hash, applied, errText)
+	return p.batch5Panel.PostRelayAckContext(ctx, version, hash, applied, errText)
 }
 
 func TestBatch1AOrdinaryRelayRemovalCutsFlowAndPersistsBeforeACK(t *testing.T) {

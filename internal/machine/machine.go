@@ -4,7 +4,6 @@ package machine
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -174,10 +173,11 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 	perNodeClient.ResetConfigETag()
 
 	var push controlplane.PushClient
-	if o.ws != nil {
+	ws := o.ws
+	if ws != nil {
 		push = &machineNodePush{
 			nodeID: mn.ID,
-			ws:     o.ws,
+			ws:     ws,
 		}
 	}
 
@@ -198,6 +198,9 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 	go func() {
 		defer close(done)
 		defer o.unregisterNode(mn.ID, mb)
+		if ws != nil {
+			defer ws.ForgetDeviceReportForNode(mn.ID)
+		}
 		if err := svc.Run(nodeCtx); err != nil {
 			nlog.Core().Error("machine node exited with error",
 				"node_id", mn.ID, "error", err)
@@ -432,15 +435,5 @@ func (p *machineNodePush) SendDeviceReport(devices map[int][]string) {
 	if p.ws == nil {
 		return
 	}
-	payload := map[string]interface{}{
-		"node_id": p.nodeID,
-	}
-	// Flatten into the standard format with node_id wrapper.
-	strDevices := make(map[string][]string, len(devices))
-	for uid, ips := range devices {
-		strDevices[fmt.Sprintf("%d", uid)] = ips
-	}
-	payload["devices"] = strDevices
-	data, _ := json.Marshal(payload)
-	p.ws.SendRaw(panel.WSEventReportDevices, data)
+	p.ws.SendDeviceReportForNode(p.nodeID, devices)
 }

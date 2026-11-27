@@ -3,9 +3,12 @@ package tracker
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -53,10 +56,8 @@ type snapshot struct {
 // not O(connections).
 //
 // Thread safety: Process() acquires mu to update internal state, then
-// atomically publishes a new snapshot. All read methods (Flush*,
-// CurrentOnline, LogStats, *Speed) read the snapshot lock-free.
-// This eliminates contention between the 10s Process tick and the 60s
-// flush/push tick.
+// atomically publishes a new snapshot. Observability reads use that
+// snapshot lock-free. Traffic enqueue and acknowledgement use mu.
 type Tracker struct {
 	mu sync.Mutex
 
@@ -73,14 +74,8 @@ type Tracker struct {
 	// Protected by mu.
 	pendingFrom int64
 
-	// unacked is the last flushed batch that the panel has not yet
-	// acknowledged. It is re-sent verbatim and never merged with new
-	// samples. Protected by mu.
-	unacked *Batch
-
-	// storePath, when set via EnablePersistence, is where the
-	// unacknowledged batch is persisted so a process restart can
-	// resend it with its original ID (SB-TA-010). Protected by mu.
+	// queue holds immutable batches in send order. Protected by mu.
+	queue     []*Batch
 	storePath string
 
 	// batchSeq disambiguates batch IDs generated in the same process;
@@ -92,11 +87,6 @@ type Tracker struct {
 	// Readers load this pointer without any lock.
 	live atomic.Pointer[snapshot]
 
-	// aliveIPsBuf is a reusable buffer for FlushAliveIPs output.
-	// Avoids allocating a new map+slice every 60s.
-	aliveIPsBuf map[int][]string
-
-	// lastAliveIPsHash detects changes to avoid duplicate reports.
 	lastAliveIPsHash string
 }
 
@@ -109,7 +99,6 @@ func New() *Tracker {
 	t := &Tracker{
 		lastSeen:       make(map[int][2]int64),
 		pendingTraffic: make(map[int][2]int64),
-		aliveIPsBuf:    make(map[int][]string),
 		idPrefix:       idPrefix,
 	}
 	// Publish initial empty snapshot.
@@ -200,6 +189,10 @@ func (t *Tracker) FlushTraffic() map[int][2]int64 {
 func (t *Tracker) FlushBatch() *Batch {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.flushBatchLocked()
+}
+
+func (t *Tracker) flushBatchLocked() *Batch {
 	if len(t.pendingTraffic) == 0 {
 		return nil
 	}
@@ -219,36 +212,57 @@ func (t *Tracker) FlushBatch() *Batch {
 	}
 }
 
-// SetUnacked records the batch awaiting panel acknowledgement.
-func (t *Tracker) SetUnacked(b *Batch) {
+// QueuePending seals and persists the current sampling window before sending.
+func (t *Tracker) QueuePending() error {
 	t.mu.Lock()
-	t.unacked = b
-	t.persistUnackedLocked()
-	t.mu.Unlock()
+	defer t.mu.Unlock()
+	if batch := t.flushBatchLocked(); batch != nil {
+		t.queue = append(t.queue, batch)
+	}
+	if len(t.queue) == 0 {
+		return nil
+	}
+	return t.persistQueueLocked()
 }
 
-// Unacked returns the batch awaiting acknowledgement, or nil.
+// SetUnacked records a batch awaiting panel acknowledgement.
+func (t *Tracker) SetUnacked(b *Batch) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if b != nil {
+		t.queue = append(t.queue, b)
+	}
+	if err := t.persistQueueLocked(); err != nil {
+		nlog.Core().Warn("tracker: failed to persist traffic queue", "error", err)
+	}
+}
+
 func (t *Tracker) Unacked() *Batch {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.unacked
+	if len(t.queue) == 0 {
+		return nil
+	}
+	return t.queue[0]
 }
 
-// AckBatch clears the unacknowledged batch when the panel confirmed
-// receipt of exactly that batch. Returns false when the IDs differ
-// (a newer batch is already in flight).
+// AckBatch removes only the head, after persisting the remaining queue.
 func (t *Tracker) AckBatch(id string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.unacked != nil && t.unacked.ID == id {
-		t.unacked = nil
-		t.persistUnackedLocked()
-		return true
+	if len(t.queue) == 0 || t.queue[0].ID != id {
+		return false
 	}
-	return false
+	previous := t.queue
+	t.queue = t.queue[1:]
+	if err := t.persistQueueLocked(); err != nil {
+		t.queue = previous
+		nlog.Core().Warn("tracker: failed to persist traffic acknowledgement", "error", err)
+		return false
+	}
+	return true
 }
 
-// batchStore is the on-disk form of an unacknowledged batch.
 type batchStore struct {
 	ID            string           `json:"id"`
 	CollectedFrom int64            `json:"collected_from"`
@@ -256,81 +270,81 @@ type batchStore struct {
 	Data          map[int][2]int64 `json:"data"`
 }
 
-// EnablePersistence restores a batch a previous process left
-// unacknowledged and persists future unacknowledged batches to path
-// (SB-TA-010). Before this, the unacked batch lived only in memory:
-// any restart — including the routine shutdown flush racing a panel
-// outage — silently lost the last window of traffic. The restored
-// batch keeps its original ID, so the panel's (node, batch ID) dedup
-// books it exactly once even if the original send actually landed.
-//
-// Persistence is best-effort: failures are logged and reporting
-// continues in memory, exactly as before.
+type queueStore struct {
+	batchStore
+	Following []batchStore `json:"following,omitempty"`
+}
+
 func (t *Tracker) EnablePersistence(path string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.storePath = path
-	// The store directory is not guaranteed to exist: in machine
-	// mode a per-node ConfigDir (…/instances/…/node-<id>/) may never
-	// have been created, and then every persist fails with "no such
-	// file or directory", silently leaving that node's batches
-	// unpersisted. Create the directory up front; a failure here is
-	// still best-effort — log it and let reporting continue in
-	// memory, as with any other persistence failure.
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		nlog.Core().Warn("tracker: failed to create traffic batch store directory", "path", filepath.Dir(path), "error", err)
+		nlog.Core().Warn("tracker: failed to create traffic queue directory", "path", path, "error", err)
 	}
 	raw, err := os.ReadFile(path)
-	if err != nil {
-		return // no leftover batch (the common case)
-	}
-	var bs batchStore
-	if err := json.Unmarshal(raw, &bs); err != nil || bs.ID == "" || len(bs.Data) == 0 {
-		nlog.Core().Warn("tracker: ignoring unreadable persisted traffic batch", "path", path)
+	if os.IsNotExist(err) {
 		return
 	}
-	if t.unacked == nil {
-		t.unacked = &Batch{
-			ID:            bs.ID,
-			CollectedFrom: bs.CollectedFrom,
-			CollectedTo:   bs.CollectedTo,
-			Data:          bs.Data,
-		}
-		nlog.Core().Info("tracker: restored unacknowledged traffic batch from disk", "batch", bs.ID, "users", len(bs.Data))
+	if err != nil {
+		nlog.Core().Warn("tracker: failed to read traffic queue", "path", path, "error", err)
+		return
+	}
+	var stored queueStore
+	if err := json.Unmarshal(raw, &stored); err != nil || stored.ID == "" || len(stored.Data) == 0 {
+		nlog.Core().Warn("tracker: ignoring unreadable persisted traffic queue", "path", path)
+		return
+	}
+	for _, bs := range append([]batchStore{stored.batchStore}, stored.Following...) {
+		t.queue = append(t.queue, &Batch{bs.ID, bs.CollectedFrom, bs.CollectedTo, bs.Data})
 	}
 }
 
-// persistUnackedLocked writes the current unacked batch to the store
-// path (or removes the file once nothing is outstanding). Caller
-// holds mu.
-func (t *Tracker) persistUnackedLocked() {
+func (t *Tracker) persistQueueLocked() error {
 	if t.storePath == "" {
-		return
+		return nil
 	}
-	if t.unacked == nil {
-		if err := os.Remove(t.storePath); err != nil && !os.IsNotExist(err) {
-			nlog.Core().Warn("tracker: failed to remove persisted traffic batch", "error", err)
+	dir := filepath.Dir(t.storePath)
+	if len(t.queue) == 0 {
+		if err := os.Remove(t.storePath); os.IsNotExist(err) {
+			return nil
+		} else if err != nil {
+			return err
 		}
-		return
+	} else {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		stored := make([]batchStore, 0, len(t.queue))
+		for _, b := range t.queue {
+			stored = append(stored, batchStore{b.ID, b.CollectedFrom, b.CollectedTo, b.Data})
+		}
+		raw, err := json.Marshal(queueStore{stored[0], stored[1:]})
+		if err != nil {
+			return err
+		}
+		f, err := os.CreateTemp(dir, ".traffic-batch-*")
+		if err != nil {
+			return err
+		}
+		defer os.Remove(f.Name())
+		_, writeErr := f.Write(raw)
+		if writeErr == nil {
+			writeErr = f.Sync()
+		}
+		if err := errors.Join(writeErr, f.Close()); err != nil {
+			return err
+		}
+		if err := os.Rename(f.Name(), t.storePath); err != nil {
+			return err
+		}
 	}
-	raw, err := json.Marshal(batchStore{
-		ID:            t.unacked.ID,
-		CollectedFrom: t.unacked.CollectedFrom,
-		CollectedTo:   t.unacked.CollectedTo,
-		Data:          t.unacked.Data,
-	})
+	d, err := os.Open(dir)
 	if err != nil {
-		nlog.Core().Warn("tracker: failed to encode traffic batch for persistence", "error", err)
-		return
+		return err
 	}
-	tmp := t.storePath + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		nlog.Core().Warn("tracker: failed to persist traffic batch", "error", err)
-		return
-	}
-	if err := os.Rename(tmp, t.storePath); err != nil {
-		nlog.Core().Warn("tracker: failed to persist traffic batch", "error", err)
-	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // RestoreTraffic adds traffic back (used when push to panel fails).
@@ -352,77 +366,49 @@ func (t *Tracker) HasTraffic() bool {
 	return len(t.pendingTraffic) > 0
 }
 
-// FlushAliveIPs returns per-user alive IPs.
-// Reuses internal buffer. Returns nil if unchanged.
+// FlushAliveIPs returns an independent snapshot if the legacy cursor changed.
 func (t *Tracker) FlushAliveIPs() map[int][]string {
-	s := t.live.Load()
-
 	t.mu.Lock()
 	defer t.mu.Unlock()
-
-	// Calculate hash of current aliveIPs
-	currentHash := calcAliveIPsHash(s.aliveIPs)
-
-	// If no changes, return nil to avoid duplicate reporting
-	if currentHash == t.lastAliveIPsHash {
+	devices, hash := t.AliveIPs()
+	if hash == t.lastAliveIPsHash {
 		return nil
 	}
-
-	t.lastAliveIPsHash = currentHash
-
-	// Clear old buffer entries.
-	for k := range t.aliveIPsBuf {
-		delete(t.aliveIPsBuf, k)
-	}
-
-	// Fill buffer from snapshot.
-	for uid, ips := range s.aliveIPs {
-		buf := t.aliveIPsBuf[uid]
-		if buf == nil {
-			buf = make([]string, 0, len(ips))
-		}
-		buf = buf[:0]
-		for ip := range ips {
-			buf = append(buf, ip)
-		}
-		t.aliveIPsBuf[uid] = buf
-	}
-
-	return t.aliveIPsBuf
+	t.lastAliveIPsHash = hash
+	return devices
 }
 
-// calcAliveIPsHash computes a deterministic hash for change detection.
-func calcAliveIPsHash(aliveIPs map[int]map[string]bool) string {
-	if len(aliveIPs) == 0 {
-		return ""
+// AliveIPs returns an independently owned full snapshot and its content hash.
+func (t *Tracker) AliveIPs() (map[int][]string, string) {
+	alive := t.live.Load().aliveIPs
+	devices := make(map[int][]string, len(alive))
+	if len(alive) == 0 {
+		return devices, ""
 	}
-
-	h := sha256.New()
-
-	// Sort user IDs for consistent hashing
-	userIDs := make([]int, 0, len(aliveIPs))
-	for uid := range aliveIPs {
+	userIDs := make([]int, 0, len(alive))
+	for uid := range alive {
 		userIDs = append(userIDs, uid)
 	}
 	sort.Ints(userIDs)
-
+	h := sha256.New()
+	var number [8]byte
 	for _, uid := range userIDs {
-		ips := aliveIPs[uid]
-		// Sort IPs for consistent hashing
-		ipList := make([]string, 0, len(ips))
-		for ip := range ips {
-			ipList = append(ipList, ip)
+		ips := make([]string, 0, len(alive[uid]))
+		for ip := range alive[uid] {
+			ips = append(ips, ip)
 		}
-		sort.Strings(ipList)
-
-		// Write user ID and IPs to hash
-		h.Write([]byte{byte(uid >> 24), byte(uid >> 16), byte(uid >> 8), byte(uid)})
-		for _, ip := range ipList {
-			h.Write([]byte(ip))
+		sort.Strings(ips)
+		devices[uid] = ips
+		binary.LittleEndian.PutUint64(number[:], uint64(uid))
+		h.Write(number[:])
+		binary.LittleEndian.PutUint64(number[:], uint64(len(ips)))
+		h.Write(number[:])
+		for _, ip := range ips {
+			io.WriteString(h, ip)
+			h.Write([]byte{0})
 		}
 	}
-
-	return hex.EncodeToString(h.Sum(nil))
+	return devices, hex.EncodeToString(h.Sum(nil))
 }
 
 // CurrentOnline returns a snapshot copy of user_id → device count (distinct IPs).
@@ -434,31 +420,6 @@ func (t *Tracker) CurrentOnline() map[int]int {
 		cp[k] = v
 	}
 	return cp
-}
-
-// RestoreAliveIPs merges alive IPs back in (used when push to panel fails).
-// Note: this operates on the buffer, which will be overwritten next Process().
-func (t *Tracker) RestoreAliveIPs(data map[int][]string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	for uid, ipList := range data {
-		ips := t.aliveIPsBuf[uid]
-		if ips == nil {
-			ips = make([]string, 0, len(ipList))
-		}
-		// Use map for O(n) dedup instead of O(n²) linear search
-		existMap := make(map[string]struct{}, len(ips)+len(ipList))
-		for _, existing := range ips {
-			existMap[existing] = struct{}{}
-		}
-		for _, ip := range ipList {
-			if _, exists := existMap[ip]; !exists {
-				ips = append(ips, ip)
-				existMap[ip] = struct{}{}
-			}
-		}
-		t.aliveIPsBuf[uid] = ips
-	}
 }
 
 // LogStats logs current tracking statistics.

@@ -113,7 +113,7 @@ func (p *MachinePanelControlPlane) Discover(
 }
 
 func (p *MachinePanelControlPlane) Report(payload ReportPayload) error {
-	return p.client.Report(
+	return p.client.ReportContext(payload.Context,
 		payload.Traffic, payload.Alive, payload.Online,
 		payload.CPU, payload.Mem, payload.Swap, payload.Disk,
 		payload.Metrics,

@@ -106,3 +106,31 @@ func TestCorruptPersistedBatchIsIgnored(t *testing.T) {
 		t.Fatal("corrupt persisted batch must be ignored, not restored")
 	}
 }
+
+func TestBatch2BReadsLegacyBatchBeforeNewWindows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "traffic-batch.json")
+	legacy := []byte(`{"id":"legacy-1","collected_from":12,"collected_to":20,"data":{"7":[5,6]}}`)
+	if err := os.WriteFile(path, legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tr := New()
+	tr.EnablePersistence(path)
+	tr.Process(map[int][2]int64{7: {16, 19}}, nil, 0)
+	if err := tr.QueuePending(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := New()
+	restarted.EnablePersistence(path)
+	head := restarted.Unacked()
+	if head == nil || head.ID != "legacy-1" || head.CollectedFrom != 12 || head.CollectedTo != 20 || head.Data[7] != [2]int64{5, 6} {
+		t.Fatalf("legacy batch changed: %+v", head)
+	}
+	if !restarted.AckBatch(head.ID) {
+		t.Fatal("could not acknowledge legacy batch")
+	}
+	tail := restarted.Unacked()
+	if tail == nil || tail.ID == head.ID || tail.Data[7] != [2]int64{16, 19} {
+		t.Fatalf("new window was lost or merged: %+v", tail)
+	}
+}

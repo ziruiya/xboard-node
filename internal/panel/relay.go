@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -95,8 +96,8 @@ type RelayTrafficResult struct {
 }
 
 // FetchRelayConfig pulls the machine's current published relay config.
-func (c *Client) FetchRelayConfig() (*RelayConfigResponse, error) {
-	resp, err := c.doRequest("POST", "/api/v2/server/machine/relay/config", nil, "")
+func (c *Client) FetchRelayConfigContext(ctx context.Context) (*RelayConfigResponse, error) {
+	resp, err := c.doRequestContext(ctx, "POST", "/api/v2/server/machine/relay/config", nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("relay config: %w", err)
 	}
@@ -115,7 +116,7 @@ func (c *Client) FetchRelayConfig() (*RelayConfigResponse, error) {
 // PostRelayAck persists the apply result for one config version. The
 // panel rejects unknown versions (422) and hash mismatches (applied is
 // recorded as false with the machine's relay_last_error set).
-func (c *Client) PostRelayAck(version int, hash string, applied bool, errText string) error {
+func (c *Client) PostRelayAckContext(ctx context.Context, version int, hash string, applied bool, errText string) error {
 	payload := map[string]interface{}{
 		"version": version,
 		"applied": applied,
@@ -126,12 +127,12 @@ func (c *Client) PostRelayAck(version int, hash string, applied bool, errText st
 	if errText != "" {
 		payload["error"] = errText
 	}
-	return c.postJSON("/api/v2/server/machine/relay/ack", payload)
+	return c.postJSONContext(ctx, "/api/v2/server/machine/relay/ack", payload)
 }
 
 // PostRelayTraffic submits traffic batches (max 500 per call, enforced
 // panel-side) and returns the ingest counters.
-func (c *Client) PostRelayTraffic(batches []RelayTrafficBatch) (*RelayTrafficResult, error) {
+func (c *Client) PostRelayTrafficContext(ctx context.Context, batches []RelayTrafficBatch) (*RelayTrafficResult, error) {
 	if len(batches) == 0 {
 		return &RelayTrafficResult{}, nil
 	}
@@ -141,7 +142,7 @@ func (c *Client) PostRelayTraffic(batches []RelayTrafficBatch) (*RelayTrafficRes
 	if err != nil {
 		return nil, fmt.Errorf("marshal relay traffic: %w", err)
 	}
-	resp, err := c.doRequest("POST", "/api/v2/server/machine/relay/traffic", body, "")
+	resp, err := c.doRequestContext(ctx, "POST", "/api/v2/server/machine/relay/traffic", body, "")
 	if err != nil {
 		return nil, fmt.Errorf("relay traffic: %w", err)
 	}
@@ -153,7 +154,10 @@ func (c *Client) PostRelayTraffic(batches []RelayTrafficBatch) (*RelayTrafficRes
 		Status string             `json:"status"`
 		Data   RelayTrafficResult `json:"data"`
 	}
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read relay traffic result: %w", err)
+	}
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		// Tolerate a bare result object without the envelope.
 		var bare RelayTrafficResult

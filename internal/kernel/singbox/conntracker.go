@@ -466,6 +466,19 @@ func (t *ConnTracker) GetUserTraffic() (traffic map[int][2]int64, aliveIPs map[i
 	return
 }
 
+// trafficTotals reads only the cumulative counters of this instance.
+func (t *ConnTracker) trafficTotals() map[int][2]int64 {
+	t.usersMu.RLock()
+	defer t.usersMu.RUnlock()
+	totals := make(map[int][2]int64, len(t.users))
+	for uid, us := range t.users {
+		if up, down := us.upload.Load(), us.download.Load(); up > 0 || down > 0 {
+			totals[uid] = [2]int64{up, down}
+		}
+	}
+	return totals
+}
+
 // CloseByID force-closes a connection by its ID.
 func (t *ConnTracker) CloseByID(id string) bool {
 	t.usersMu.RLock()

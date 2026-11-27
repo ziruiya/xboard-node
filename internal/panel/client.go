@@ -2,6 +2,7 @@ package panel
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -118,6 +119,12 @@ func (c *Client) Report(traffic map[int][2]int64, alive map[int][]string, online
 	metrics map[string]interface{},
 	batch *TrafficBatchMeta,
 ) error {
+	return c.ReportContext(context.Background(), traffic, alive, online, cpu, mem, swap, disk, metrics, batch)
+}
+
+func (c *Client) ReportContext(ctx context.Context, traffic map[int][2]int64, alive map[int][]string, online map[int]int,
+	cpu float64, mem, swap, disk [2]uint64, metrics map[string]interface{}, batch *TrafficBatchMeta,
+) error {
 	payload := make(map[string]interface{})
 
 	// SB-TA-001/002/004: batch envelope. Panels that predate the
@@ -185,7 +192,7 @@ func (c *Client) Report(traffic map[int][2]int64, alive map[int][]string, online
 		payload["metrics"] = metrics
 	}
 
-	return c.postJSON("/api/v2/server/report", payload)
+	return c.postJSONContext(ctx, "/api/v2/server/report", payload)
 }
 
 // decodeWeakRaw decodes an interface (from JSON map) into a struct using weak type conversion.
@@ -423,6 +430,10 @@ func (c *Client) authQuery() url.Values {
 
 // postJSON marshals a map payload (with auth fields injected) and POSTs it.
 func (c *Client) postJSON(path string, payload map[string]interface{}) error {
+	return c.postJSONContext(context.Background(), path, payload)
+}
+
+func (c *Client) postJSONContext(ctx context.Context, path string, payload map[string]interface{}) error {
 	c.injectAuth(payload)
 
 	body, err := json.Marshal(payload)
@@ -430,7 +441,7 @@ func (c *Client) postJSON(path string, payload map[string]interface{}) error {
 		return fmt.Errorf("marshal: %w", err)
 	}
 
-	resp, err := c.doRequest("POST", path, body, "")
+	resp, err := c.doRequestContext(ctx, "POST", path, body, "")
 	if err != nil {
 		return fmt.Errorf("post %s: %w", path, err)
 	}
@@ -444,6 +455,13 @@ func (c *Client) postJSON(path string, payload map[string]interface{}) error {
 }
 
 func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string) (*http.Response, error) {
+	return c.doRequestContext(context.Background(), method, path, body, ifNoneMatch)
+}
+
+func (c *Client) doRequestContext(ctx context.Context, method, path string, body []byte, ifNoneMatch string) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	fullURL := c.baseURL + path
 
 	var bodyReader io.Reader
@@ -458,7 +476,7 @@ func (c *Client) doRequest(method, path string, body []byte, ifNoneMatch string)
 		bodyReader = bytes.NewReader(merged)
 	}
 
-	req, err := http.NewRequest(method, fullURL, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, method, fullURL, bodyReader)
 	if err != nil {
 		return nil, withoutRequestURL(err)
 	}

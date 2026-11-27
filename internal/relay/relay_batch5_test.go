@@ -39,17 +39,17 @@ type batch5Ack struct {
 	err     string
 }
 
-func (p *batch5Panel) FetchRelayConfig() (*panel.RelayConfigResponse, error) {
+func (p *batch5Panel) FetchRelayConfigContext(_ context.Context) (*panel.RelayConfigResponse, error) {
 	hash := fmt.Sprintf("hash-%d", p.doc.Version)
 	return &panel.RelayConfigResponse{Version: p.doc.Version, Config: p.doc, Hash: &hash}, nil
 }
 
-func (p *batch5Panel) PostRelayAck(version int, _ string, applied bool, errText string) error {
+func (p *batch5Panel) PostRelayAckContext(_ context.Context, version int, _ string, applied bool, errText string) error {
 	p.acks = append(p.acks, batch5Ack{version, applied, errText})
 	return nil
 }
 
-func (p *batch5Panel) PostRelayTraffic(batches []panel.RelayTrafficBatch) (*panel.RelayTrafficResult, error) {
+func (p *batch5Panel) PostRelayTrafficContext(_ context.Context, batches []panel.RelayTrafficBatch) (*panel.RelayTrafficResult, error) {
 	p.posts = append(p.posts, batches...)
 	return &panel.RelayTrafficResult{Accepted: len(batches)}, nil
 }
@@ -87,7 +87,7 @@ func TestBatch5TrafficWaitsForDurableQueue(t *testing.T) {
 	client := &batch5Panel{}
 	m := batch5Manager(dir, client)
 	m.state.Banked["test"] = counters{In: 42}
-	m.flushTraffic()
+	m.flushTrafficContext(context.Background())
 	if len(client.posts) != 0 {
 		t.Fatal("posted a traffic batch before persistence")
 	}
@@ -98,7 +98,7 @@ func TestBatch5TrafficWaitsForDurableQueue(t *testing.T) {
 	if err := os.Remove(parent); err != nil {
 		t.Fatal(err)
 	}
-	m.flushTraffic()
+	m.flushTrafficContext(context.Background())
 	if len(client.posts) != 1 {
 		t.Fatalf("posts after retry = %d, want 1", len(client.posts))
 	}

@@ -186,9 +186,9 @@ func svcCurrentConns(svc coreservice.Service) int64 {
 }
 
 type relayPanel interface {
-	FetchRelayConfig() (*panel.RelayConfigResponse, error)
-	PostRelayAck(version int, hash string, applied bool, errText string) error
-	PostRelayTraffic([]panel.RelayTrafficBatch) (*panel.RelayTrafficResult, error)
+	FetchRelayConfigContext(context.Context) (*panel.RelayConfigResponse, error)
+	PostRelayAckContext(ctx context.Context, version int, hash string, applied bool, errText string) error
+	PostRelayTrafficContext(context.Context, []panel.RelayTrafficBatch) (*panel.RelayTrafficResult, error)
 }
 
 // Manager owns the relay data plane for one machine-mode agent.
@@ -200,7 +200,9 @@ type Manager struct {
 	interfaceAddrs func() ([]net.Addr, error)
 
 	mu             sync.Mutex
-	flushMu        sync.Mutex // NODE-003: serializes flushTraffic end to end
+	flushMu        sync.Mutex      // NODE-003: serializes flushTraffic end to end
+	stateReleased  bool            // guarded by mu; a retired manager can never write again
+	runCtx         context.Context // guarded by mu
 	gostInitOnce   sync.Once
 	genCounter     atomic.Int64 // R04: per-start generation, suffixes gost component names
 	state          *diskState
@@ -237,12 +239,23 @@ func NewManager(client *panel.Client, machineID int, stateDir string) *Manager {
 
 // Run blocks until ctx is cancelled: config sync loop + traffic loop.
 func (m *Manager) Run(ctx context.Context) {
+	release, err := m.acquireStateGeneration()
+	if err != nil {
+		nlog.Core().Error("relay cannot acquire traffic state", "error", err)
+		return
+	}
+	defer release()
+	m.mu.Lock()
+	m.runCtx = ctx
 	m.loadState()
+	m.mu.Unlock()
 	m.ensureGostInit()
 	nlog.Core().Info("relay manager started", "machine_id", m.machineID, "boot_id", m.bootID, "state_dir", m.stateDir)
 
-	go m.trafficLoop(ctx)
+	var traffic sync.WaitGroup
+	traffic.Go(func() { m.trafficLoop(ctx) })
 	m.syncLoop(ctx)
+	traffic.Wait()
 
 	// Shutdown: stop listeners, then one best-effort traffic flush.
 	m.mu.Lock()
@@ -253,14 +266,9 @@ func (m *Manager) Run(ctx context.Context) {
 	stopped := m.zombieRuntimesLocked()
 	m.mu.Unlock()
 	m.waitDrain(ctx, stopped)
-	flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	done := make(chan struct{})
-	go func() { m.flushTraffic(); close(done) }()
-	select {
-	case <-done:
-	case <-flushCtx.Done():
-	}
+	// The cancelled context prevents network sends. The last counters are
+	// saved synchronously, under the same state lease as periodic reporting.
+	m.flushTrafficContext(ctx)
 	nlog.Core().Info("relay manager stopped")
 }
 
@@ -279,6 +287,13 @@ func (m *Manager) syncLoop(ctx context.Context) {
 }
 
 func (m *Manager) trafficLoop(ctx context.Context) {
+	// Retry recovered batches immediately after a restart or handoff.
+	m.mu.Lock()
+	hasPending := len(m.state.Pending) != 0
+	m.mu.Unlock()
+	if hasPending && ctx.Err() == nil {
+		m.flushTrafficContext(ctx)
+	}
 	t := time.NewTicker(trafficInterval)
 	defer t.Stop()
 	for {
@@ -286,7 +301,7 @@ func (m *Manager) trafficLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			m.flushTraffic()
+			m.flushTrafficContext(ctx)
 		}
 	}
 }
@@ -294,7 +309,7 @@ func (m *Manager) trafficLoop(ctx context.Context) {
 // ─── Config sync ─────────────────────────────────────────────────────
 
 func (m *Manager) syncOnce(ctx context.Context) {
-	resp, err := m.client.FetchRelayConfig()
+	resp, err := m.client.FetchRelayConfigContext(ctx)
 	if err != nil {
 		nlog.Core().Warn("relay config fetch failed", "error", err)
 		return
@@ -348,7 +363,11 @@ func (m *Manager) syncOnce(ctx context.Context) {
 
 // ackLocked records and sends an ack. Caller holds m.mu.
 func (m *Manager) ackLocked(version int, hash string, applied bool, errText string) {
-	if err := m.client.PostRelayAck(version, hash, applied, errText); err != nil {
+	ctx := m.runCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := m.client.PostRelayAckContext(ctx, version, hash, applied, errText); err != nil {
 		nlog.Core().Warn("relay ack failed", "version", version, "applied", applied, "error", err)
 		return
 	}
@@ -1159,11 +1178,15 @@ func (m *Manager) collectTrafficLocked() {
 // delete batches a younger flush had just enqueued (and not yet sent
 // successfully). Settlement now removes exactly the batches the panel
 // accounted for, by identity, never the whole queue by position.
-func (m *Manager) flushTraffic() {
+func (m *Manager) flushTrafficContext(ctx context.Context) {
 	m.flushMu.Lock()
 	defer m.flushMu.Unlock()
 
 	m.mu.Lock()
+	if m.stateReleased {
+		m.mu.Unlock()
+		return
+	}
 	m.collectTrafficLocked()
 	pending := append([]panel.RelayTrafficBatch(nil), m.state.Pending...)
 	saveErr := m.saveStateLocked()
@@ -1176,17 +1199,17 @@ func (m *Manager) flushTraffic() {
 	if len(pending) == 0 {
 		return
 	}
-	for start := 0; start < len(pending); start += 500 {
+	for start := 0; start < len(pending) && ctx.Err() == nil; start += 500 {
 		end := start + 500
 		if end > len(pending) {
 			end = len(pending)
 		}
-		res, err := m.client.PostRelayTraffic(pending[start:end])
+		res, err := m.client.PostRelayTrafficContext(ctx, pending[start:end])
 		if err != nil {
 			nlog.Core().Warn("relay traffic report failed, batches stay queued", "count", len(pending), "error", err)
 			return
 		}
-		if !m.settleChunk(pending[start:end], res) {
+		if ctx.Err() != nil || !m.settleChunk(pending[start:end], res) {
 			return
 		}
 	}
@@ -1271,8 +1294,13 @@ func (m *Manager) settleChunk(chunk []panel.RelayTrafficBatch, res *panel.RelayT
 	}
 
 	m.mu.Lock()
-	kept := m.state.Pending[:0]
-	for _, b := range m.state.Pending {
+	defer m.mu.Unlock()
+	if m.stateReleased {
+		return false
+	}
+	previous := m.state.Pending
+	kept := make([]panel.RelayTrafficBatch, 0, len(previous))
+	for _, b := range previous {
 		if settled[keyOf(b)] {
 			continue
 		}
@@ -1281,15 +1309,47 @@ func (m *Manager) settleChunk(chunk []panel.RelayTrafficBatch, res *panel.RelayT
 	// Only this chunk's identities are in the settled set, so batches
 	// from later chunks (not yet sent) survive untouched.
 	m.state.Pending = kept
-	saveErr := m.saveStateLocked()
-	m.mu.Unlock()
-	if saveErr != nil {
-		nlog.Core().Error("relay traffic settlement could not be persisted", "error", saveErr)
+	if err := m.saveStateLocked(); err != nil {
+		m.state.Pending = previous
+		nlog.Core().Error("relay traffic settlement could not be persisted", "error", err)
+		return false
 	}
 	return true
 }
 
 // ─── Durable state ───────────────────────────────────────────────────
+
+// acquireStateGeneration grants this manager exclusive ownership of the state
+// directory until every writer has finished. The lock file is kept in place
+// so all managers opening this path contend on the same inode.
+func (m *Manager) acquireStateGeneration() (func(), error) {
+	if err := os.MkdirAll(m.stateDir, 0o755); err != nil {
+		return nil, err
+	}
+	lease, err := os.OpenFile(m.statePath()+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(lease.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lease.Close()
+		return nil, err
+	}
+	m.mu.Lock()
+	released := m.stateReleased
+	m.mu.Unlock()
+	if released {
+		lease.Close()
+		return nil, errStateGenerationReleased
+	}
+	return func() {
+		m.mu.Lock()
+		m.stateReleased = true
+		lease.Close()
+		m.mu.Unlock()
+	}, nil
+}
+
+var errStateGenerationReleased = errors.New("relay traffic state generation released")
 
 func (m *Manager) statePath() string {
 	return filepath.Join(m.stateDir, stateFileName)
@@ -1358,6 +1418,9 @@ func (m *Manager) loadState() {
 
 // saveStateLocked persists the traffic state atomically. Caller holds m.mu.
 func (m *Manager) saveStateLocked() error {
+	if m.stateReleased {
+		return errStateGenerationReleased
+	}
 	if err := os.MkdirAll(m.stateDir, 0o755); err != nil {
 		return fmt.Errorf("create relay state directory: %w", err)
 	}
