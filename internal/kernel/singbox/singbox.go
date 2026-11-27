@@ -248,6 +248,10 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 	}
 	nlog.Core().Debug("sing-box routing reloaded")
 
+	if err := s.removeEmptyAuthInboundLocked(users); err != nil {
+		return err
+	}
+
 	nopFactory := singLog.NewNOPFactory()
 
 	// Configuration hash check for inbound reconstruction
@@ -539,6 +543,25 @@ func (s *SingBox) UpdateUsers(users []model.UserSpec) (added, removed int, err e
 	return
 }
 
+// Close the old listener with its authenticator intact. buildInbound omits
+// its empty replacement, and a later non-empty update creates it again.
+func (s *SingBox) removeEmptyAuthInboundLocked(users []model.UserSpec) error {
+	if s.box == nil || !omitEmptyAuthInbound(s.nodeConfig, users) {
+		return nil
+	}
+	im := service.FromContext[adapter.InboundManager](s.ctx)
+	if im == nil {
+		return fmt.Errorf("inbound manager not available")
+	}
+	tag := s.nodeConfig.Protocol + "-in"
+	if _, exists := im.Get(tag); exists {
+		if err := im.Remove(tag); err != nil {
+			return fmt.Errorf("remove inbound %s for empty user set: %w", tag, err)
+		}
+	}
+	return nil
+}
+
 // reloadInboundsLocked hot-swaps inbound users using UpdatableInbound.
 // Must be called with s.mu held.
 func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
@@ -561,6 +584,10 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 	router := service.FromContext[adapter.Router](s.ctx)
 	if router == nil {
 		return fmt.Errorf("router not available")
+	}
+
+	if err := s.removeEmptyAuthInboundLocked(users); err != nil {
+		return err
 	}
 
 	nopFactory := singLog.NewNOPFactory()

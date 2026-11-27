@@ -429,7 +429,23 @@ func mergeCustomSingboxRoute(cfg M, customRoute map[string]any) {
 	}
 }
 
+// These inbounds use auth.NewAuthenticator, which returns nil for zero users.
+func omitEmptyAuthInbound(nc *model.NodeSpec, users []model.UserSpec) bool {
+	if nc == nil || len(users) != 0 {
+		return false
+	}
+	switch nc.Protocol {
+	case "socks", "http", "naive":
+		return true
+	default:
+		return false
+	}
+}
+
 func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
+	if omitEmptyAuthInbound(nc, users) {
+		return nil
+	}
 	base := M{
 		"tag":         nc.Protocol + "-in",
 		"listen":      "::",
