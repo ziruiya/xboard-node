@@ -17,6 +17,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/machine"
 	"github.com/cedar2025/xboard-node/internal/nlog"
+	"github.com/cedar2025/xboard-node/internal/relay"
 	"github.com/cedar2025/xboard-node/internal/service"
 )
 
@@ -24,6 +25,9 @@ var (
 	version   = "dev"
 	buildTime = "unknown"
 )
+
+// exitGenerationLease signals that startup could not claim exclusive state ownership.
+const exitGenerationLease = 3
 
 func main() {
 	configPath := flag.String("c", "config.yml", "config file path")
@@ -83,12 +87,6 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		}()
 	}
 
-	initialInstances, err := initialRoot.NormalizeInstances()
-	if err != nil {
-		nlog.Core().Error("failed to normalize initial config", "error", err)
-		os.Exit(1)
-	}
-	startHealth(initialInstances[0].HealthPort)
 	defer func() {
 		if healthSrv != nil {
 			healthSrv.Close()
@@ -96,6 +94,37 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 	}()
 
 	for root := initialRoot; ; {
+		instances, err := root.NormalizeInstances()
+		if err != nil {
+			nlog.Core().Error("failed to normalize config", "error", err)
+			os.Exit(1)
+		}
+		if err := config.ValidateStartupLayout(instances); err != nil {
+			nlog.Core().Error("startup layout validation failed", "error", err)
+			os.Exit(1)
+		}
+
+		// Preflight all generations before starting any instance in this process.
+		machines := make(map[*config.Config]*machine.Orchestrator)
+		managers := make(map[*config.Config]*relay.Manager)
+		var releases []func()
+		for _, instance := range instances {
+			var release func()
+			var err error
+			if instance.IsMachineMode() {
+				orch := machine.New(instance)
+				machines[instance] = orch
+				managers[instance], release, err = orch.AcquireGeneration()
+			} else {
+				release, err = relay.AcquireGeneration(instance.Kernel.ConfigDir)
+			}
+			if err != nil {
+				nlog.Core().Error("relay cannot acquire traffic state. xboard-node process exiting before startup", "instance", instance.InstanceID, "error", err)
+				os.Exit(exitGenerationLease)
+			}
+			releases = append(releases, release)
+		}
+
 		ctx, cancel := context.WithCancel(context.Background())
 
 		sigCh := make(chan os.Signal, 1)
@@ -131,16 +160,6 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 			}
 		}()
 
-		instances, err := root.NormalizeInstances()
-		if err != nil {
-			nlog.Core().Error("failed to normalize config", "error", err)
-			os.Exit(1)
-		}
-		if err := config.ValidateStartupLayout(instances); err != nil {
-			nlog.Core().Error("startup layout validation failed", "error", err)
-			os.Exit(1)
-		}
-
 		if instances[0].HealthPort != healthPort {
 			if healthSrv != nil {
 				healthSrv.Close()
@@ -159,8 +178,7 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 				defer wg.Done()
 				if instanceCfg.IsMachineMode() {
 					nlog.Core().Info("starting machine instance", "instance", instanceCfg.InstanceID, "machine_id", instanceCfg.Machine.MachineID, "panel_url", instanceCfg.Panel.URL)
-					orch := machine.New(instanceCfg)
-					if err := orch.Run(ctx); err != nil {
+					if err := machines[instanceCfg].RunWithGeneration(ctx, managers[instanceCfg]); err != nil {
 						nlog.Core().Error("machine instance exited with error", "instance", instanceCfg.InstanceID, "error", err)
 						errCh <- err
 						cancel()
@@ -208,6 +226,9 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		case <-doneCh:
 		}
 
+		for _, release := range releases {
+			release()
+		}
 		signal.Stop(sigCh)
 		if watcher != nil {
 			watcher.Stop()

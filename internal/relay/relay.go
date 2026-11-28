@@ -245,6 +245,11 @@ func (m *Manager) Run(ctx context.Context) {
 		return
 	}
 	defer release()
+	m.RunWithGeneration(ctx)
+}
+
+// RunWithGeneration runs under a generation lease already held by the caller.
+func (m *Manager) RunWithGeneration(ctx context.Context) {
 	m.mu.Lock()
 	m.runCtx = ctx
 	m.loadState()
@@ -1323,10 +1328,36 @@ func (m *Manager) settleChunk(chunk []panel.RelayTrafficBatch, res *panel.RelayT
 // directory until every writer has finished. The lock file is kept in place
 // so all managers opening this path contend on the same inode.
 func (m *Manager) acquireStateGeneration() (func(), error) {
-	if err := os.MkdirAll(m.stateDir, 0o755); err != nil {
+	return m.AcquireGeneration()
+}
+
+// AcquireGeneration holds the relay state lease across the whole machine lifecycle.
+func (m *Manager) AcquireGeneration() (func(), error) {
+	release, err := AcquireGeneration(m.stateDir)
+	if err != nil {
 		return nil, err
 	}
-	lease, err := os.OpenFile(m.statePath()+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	m.mu.Lock()
+	released := m.stateReleased
+	m.mu.Unlock()
+	if released {
+		release()
+		return nil, errStateGenerationReleased
+	}
+	return func() {
+		m.mu.Lock()
+		m.stateReleased = true
+		release()
+		m.mu.Unlock()
+	}, nil
+}
+
+// AcquireGeneration takes the same nonblocking state lease in every agent mode.
+func AcquireGeneration(stateDir string) (func(), error) {
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		return nil, err
+	}
+	lease, err := os.OpenFile(filepath.Join(stateDir, stateFileName)+".lock", os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -1334,19 +1365,7 @@ func (m *Manager) acquireStateGeneration() (func(), error) {
 		lease.Close()
 		return nil, err
 	}
-	m.mu.Lock()
-	released := m.stateReleased
-	m.mu.Unlock()
-	if released {
-		lease.Close()
-		return nil, errStateGenerationReleased
-	}
-	return func() {
-		m.mu.Lock()
-		m.stateReleased = true
-		lease.Close()
-		m.mu.Unlock()
-	}, nil
+	return func() { lease.Close() }, nil
 }
 
 var errStateGenerationReleased = errors.New("relay traffic state generation released")

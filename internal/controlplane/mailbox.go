@@ -8,6 +8,7 @@ import (
 
 // MailboxState is the coalesced snapshot drained from a NodeMailbox.
 type MailboxState struct {
+	Events         []Event
 	Config         *model.NodeSpec
 	Users          []model.UserSpec
 	DeviceUsers    map[int][]string
@@ -21,6 +22,7 @@ type MailboxState struct {
 // yet ready to process them. Events are coalesced (latest-wins) and drained
 // as a single snapshot once the service marks the mailbox as ready.
 type NodeMailbox struct {
+	events           []Event
 	mu               sync.Mutex
 	ready            bool
 	config           *model.NodeSpec
@@ -97,27 +99,40 @@ func (m *NodeMailbox) Apply(event Event) {
 	m.mu.Lock()
 	changed := false
 
-	switch event.Type {
-	case EventSyncConfig:
+	switch {
+	case (event.Session != 0 || event.StateRevision != nil || event.BaseRevision != nil) &&
+		(event.Type == EventSyncConfig || event.Type == EventSyncUsers || event.Type == EventSyncUserDelta):
+		// Preserve wire order through the service's commit point. Bound the
+		// backlog while the service is starting or applying a snapshot.
+		if len(m.events) == 256 {
+			m.events = nil
+			m.needsReconcile = true
+		}
+		event.Config = cloneNodeSpec(event.Config)
+		event.Users = cloneUsers(event.Users)
+		event.DeltaUsers = cloneUsers(event.DeltaUsers)
+		m.events = append(m.events, event)
+		changed = true
+	case event.Type == EventSyncConfig:
 		if event.Config != nil {
 			m.config = cloneNodeSpec(event.Config)
 			m.dirtyConfig = true
 			changed = true
 		}
-	case EventSyncUsers:
+	case event.Type == EventSyncUsers:
 		if event.Users != nil {
 			m.users = cloneUsers(event.Users)
 			m.dirtyUsers = true
 			m.hasFullUserState = true
 			changed = true
 		}
-	case EventSyncDevices:
+	case event.Type == EventSyncDevices:
 		if event.DeviceUsers != nil {
 			m.deviceUsers = cloneDeviceUsers(event.DeviceUsers)
 			m.dirtyDevices = true
 			changed = true
 		}
-	case EventSyncUserDelta:
+	case event.Type == EventSyncUserDelta:
 		// Legacy deltas carry no base revision, even with a full local baseline.
 		m.needsReconcile = true
 		changed = true
@@ -144,7 +159,8 @@ func (m *NodeMailbox) DrainIfReady() MailboxState {
 	if !m.ready {
 		return MailboxState{}
 	}
-	state := MailboxState{NeedsReconcile: m.needsReconcile}
+	state := MailboxState{NeedsReconcile: m.needsReconcile, Events: m.events}
+	m.events = nil
 	if m.dirtyConfig && m.config != nil {
 		state.Config = cloneNodeSpec(m.config)
 		state.HasConfig = true

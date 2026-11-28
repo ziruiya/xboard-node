@@ -21,7 +21,7 @@ func TestBatch2BDeviceSnapshotsSurviveQueueSaturationAndReconnect(t *testing.T) 
 	w.session <- wsMessage{Event: "pong"} // The generic queue is full.
 	w.SendDeviceReportForNode(5, map[int][]string{1: {"192.0.2.1"}})
 	w.SendDeviceReportForNode(5, map[int][]string{2: {"192.0.2.2"}})
-	want := `{"devices":{"2":["192.0.2.2"]},"node_id":5}`
+	want := `{"alive_complete":true,"devices":{"2":["192.0.2.2"]},"node_id":5}`
 	sent := make(map[int]json.RawMessage)
 	broken := errors.New("socket closed")
 	if err := w.writeDeviceSnapshots(sent, func(msg wsMessage) error {
@@ -52,12 +52,12 @@ func TestBatch2BDeviceSnapshotsSurviveQueueSaturationAndReconnect(t *testing.T) 
 	if err := w.writeDeviceSnapshots(sent, record); err != nil {
 		t.Fatal(err)
 	}
-	if len(frames) != 3 || frames[2] != `{"devices":{},"node_id":5}` {
+	if len(frames) != 3 || frames[2] != `{"alive_complete":true,"devices":{},"node_id":5}` {
 		t.Fatalf("empty full snapshot missing: %v", frames)
 	}
 }
 
-func TestBatch2BWSReconnectReplaysFullDeviceSnapshot(t *testing.T) {
+func TestWSReconnectSendsFreshDeviceSnapshot(t *testing.T) {
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if errors.Is(err, os.ErrPermission) {
 		t.Skipf("loopback socket unavailable: %v", err)
@@ -88,9 +88,19 @@ func TestBatch2BWSReconnectReplaysFullDeviceSnapshot(t *testing.T) {
 	server := &httptest.Server{Listener: listener, Config: &http.Server{Handler: handler}}
 	server.Start()
 	defer server.Close()
-	client := NewWSClient("ws"+strings.TrimPrefix(server.URL, "http"), "test-token", 0,
-		WSClientConfig{MachineID: 1, BackoffInitial: time.Millisecond, BackoffMax: time.Millisecond}, nil, nil, nil)
-	client.SendDeviceReportForNode(5, map[int][]string{2: {"192.0.2.2"}})
+	var client *WSClient
+	var sessions int
+	client = NewWSClient("ws"+strings.TrimPrefix(server.URL, "http"), "test-token", 0,
+		WSClientConfig{MachineID: 1, BackoffInitial: time.Millisecond, BackoffMax: time.Millisecond}, nil, func(status WSStatusChange) {
+			if status.Connected {
+				sessions++
+				devices := map[int][]string{2: {"192.0.2.2"}}
+				if sessions > 1 {
+					devices = map[int][]string{2: {"192.0.2.2"}, 3: {"192.0.2.3"}}
+				}
+				client.SendDeviceReportForNode(5, devices)
+			}
+		}, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	done := make(chan struct{})
 	go func() { defer close(done); client.Run(ctx) }()
@@ -98,7 +108,11 @@ func TestBatch2BWSReconnectReplaysFullDeviceSnapshot(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		select {
 		case frame := <-frames:
-			if frame.Event != WSEventReportDevices || string(frame.Data) != `{"devices":{"2":["192.0.2.2"]},"node_id":5}` {
+			want := `{"alive_complete":true,"devices":{"2":["192.0.2.2"]},"node_id":5}`
+			if i == 1 {
+				want = `{"alive_complete":true,"devices":{"2":["192.0.2.2"],"3":["192.0.2.3"]},"node_id":5}`
+			}
+			if frame.Event != WSEventReportDevices || string(frame.Data) != want {
 				t.Fatalf("session %d: wrong frame %+v", i, frame)
 			}
 		case <-ctx.Done():

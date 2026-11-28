@@ -119,9 +119,13 @@ func (c *Client) Report(traffic map[int][2]int64, alive map[int][]string, online
 	metrics map[string]interface{},
 	batch *TrafficBatchMeta,
 ) error {
+	if alive == nil {
+		alive = map[int][]string{}
+	}
 	return c.ReportContext(context.Background(), traffic, alive, online, cpu, mem, swap, disk, metrics, batch)
 }
 
+// ReportContext accepts nil alive when the kernel cannot provide a complete device snapshot.
 func (c *Client) ReportContext(ctx context.Context, traffic map[int][2]int64, alive map[int][]string, online map[int]int,
 	cpu float64, mem, swap, disk [2]uint64, metrics map[string]interface{}, batch *TrafficBatchMeta,
 ) error {
@@ -152,7 +156,8 @@ func (c *Client) ReportContext(ctx context.Context, traffic map[int][2]int64, al
 		}()
 	}
 
-	if len(alive) > 0 {
+	if alive != nil {
+		payload["alive_complete"] = true
 		a := aliveMapPool.Get().(map[string][]string)
 		for uid, ips := range alive {
 			a[strconv.Itoa(uid)] = ips
@@ -257,9 +262,20 @@ func (c *Client) GetConfig(stage ...*string) (*NodeConfig, error) {
 		return nil, fmt.Errorf("status %d (%s)", resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 
-	var raw map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+	var body json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return nil, fmt.Errorf("decode raw config: %w", err)
+	}
+
+	var raw map[string]interface{}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("decode config: %w", err)
+	}
+	var revision struct {
+		StateRevision *uint64 `json:"state_revision"`
+	}
+	if err := json.Unmarshal(body, &revision); err != nil {
+		return nil, fmt.Errorf("decode config revision: %w", err)
 	}
 
 	var cfg NodeConfig
@@ -276,12 +292,17 @@ func (c *Client) GetConfig(stage ...*string) (*NodeConfig, error) {
 	if len(stage) > 0 {
 		*stage[0] = resp.Header.Get("ETag")
 	}
+	cfg.StateRevision = revision.StateRevision
 	return &cfg, nil
 }
 
 // GetUsers fetches available users. Returns nil if not modified (304).
 // If provided, stage receives the response validator for later commit.
 func (c *Client) GetUsers(stage ...*string) ([]User, error) {
+	return c.GetUsersWithRevision(nil, stage...)
+}
+
+func (c *Client) GetUsersWithRevision(revision **uint64, stage ...*string) ([]User, error) {
 	resp, err := c.doRequest("GET", c.userPath(), nil, c.userETag)
 	if err != nil {
 		return nil, fmt.Errorf("get users: %w", err)
@@ -306,6 +327,9 @@ func (c *Client) GetUsers(stage ...*string) ([]User, error) {
 	if len(stage) > 0 {
 		*stage[0] = resp.Header.Get("ETag")
 	}
+	if revision != nil {
+		*revision = usersResp.StateRevision
+	}
 	return usersResp.Users, nil
 }
 
@@ -323,10 +347,8 @@ func (c *Client) PushTraffic(data map[int][2]int64) error {
 
 // PushAlive submits online user IPs
 func (c *Client) PushAlive(data map[int][]string) error {
-	if len(data) == 0 {
-		return nil
-	}
-	payload := make(map[string]interface{}, len(data))
+	payload := make(map[string]interface{}, len(data)+1)
+	payload["alive_complete"] = true
 	for uid, ips := range data {
 		payload[strconv.Itoa(uid)] = ips
 	}

@@ -16,12 +16,14 @@ const (
 )
 
 type Event struct {
-	Type        EventType
-	Config      *model.NodeSpec
-	Users       []model.UserSpec
-	DeltaAction string
-	DeltaUsers  []model.UserSpec
-	DeviceUsers map[int][]string
+	StateRevision, BaseRevision *uint64
+	Session                     uint64
+	Type                        EventType
+	Config                      *model.NodeSpec
+	Users                       []model.UserSpec
+	DeltaAction                 string
+	DeltaUsers                  []model.UserSpec
+	DeviceUsers                 map[int][]string
 }
 
 type StatusChange struct {
@@ -35,12 +37,13 @@ type APIMetrics struct {
 }
 
 type Bootstrap struct {
-	PushInterval int
-	PullInterval int
-	Push         PushClient
-	Config       *model.NodeSpec
-	Users        []model.UserSpec
-	Mailbox      *NodeMailbox
+	ConfigRevision, UserRevision *uint64
+	PushInterval                 int
+	PullInterval                 int
+	Push                         PushClient
+	Config                       *model.NodeSpec
+	Users                        []model.UserSpec
+	Mailbox                      *NodeMailbox
 }
 
 type fullPollKey struct{}
@@ -51,6 +54,7 @@ func FullPoll(ctx context.Context) context.Context {
 }
 
 type Snapshot struct {
+	ConfigRevision, UserRevision *uint64
 	// Commit advances validators for the resources accepted by the service loop.
 	Commit func(configApplied, usersApplied bool)
 	Config *model.NodeSpec
@@ -85,6 +89,12 @@ type PushClient interface {
 	Run(ctx context.Context)
 	IsConnected() bool
 	SendDeviceReport(devices map[int][]string)
+}
+
+// SessionDeviceReporter binds reports to the WS connection sampled by the service.
+type SessionDeviceReporter interface {
+	Session() uint64
+	SendDeviceReportForSession(devices map[int][]string, session uint64)
 }
 
 type Source interface {

@@ -72,7 +72,7 @@ func (p *MachinePanelControlPlane) Initial(
 	if configSnapshot == nil {
 		return Bootstrap{}, fmt.Errorf("machine initial config is nil")
 	}
-	users, err := p.client.GetUsers()
+	users, err := p.client.GetUsersWithRevision(&bootstrap.UserRevision)
 	if err != nil {
 		return Bootstrap{}, fmt.Errorf("machine initial users: %w", err)
 	}
@@ -80,6 +80,7 @@ func (p *MachinePanelControlPlane) Initial(
 	if err != nil {
 		return Bootstrap{}, fmt.Errorf("machine initial config normalize: %w", err)
 	}
+	bootstrap.ConfigRevision = configSnapshot.StateRevision
 	bootstrap.Users = model.UserSpecsFromPanel(users)
 
 	// Register mailbox access after the initial snapshot is prepared, so the

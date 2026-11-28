@@ -46,6 +46,7 @@ type Orchestrator struct {
 	// Shared WS client (nil when WS is disabled).
 	ws       *panel.WSClient
 	wsCancel context.CancelFunc
+	wsDone   chan struct{}
 
 	discoveryRequested chan struct{}
 
@@ -76,8 +77,24 @@ func New(cfg *config.Config) *Orchestrator {
 	}
 }
 
-// Run is the main loop. It blocks until ctx is cancelled.
+// Run acquires the generation before starting any machine activity.
 func (o *Orchestrator) Run(ctx context.Context) error {
+	manager, release, err := o.AcquireGeneration()
+	if err != nil {
+		return fmt.Errorf("relay cannot acquire traffic state: %w", err)
+	}
+	defer release()
+	return o.RunWithGeneration(ctx, manager)
+}
+
+func (o *Orchestrator) AcquireGeneration() (*relay.Manager, func(), error) {
+	manager := relay.NewManager(o.client, o.cfg.Machine.MachineID, o.cfg.Kernel.ConfigDir)
+	release, err := manager.AcquireGeneration()
+	return manager, release, err
+}
+
+// RunWithGeneration runs under a generation lease already held by the caller.
+func (o *Orchestrator) RunWithGeneration(ctx context.Context, relayMgr *relay.Manager) error {
 	nodesResp, err := o.client.GetMachineNodes()
 	if err != nil {
 		return fmt.Errorf("initial node discovery: %w", err)
@@ -87,24 +104,25 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	nlog.Core().Info(fmt.Sprintf("machine %d: discovered %d nodes",
 		o.cfg.Machine.MachineID, len(nodesResp.Nodes)))
 
-	// Start machine-level WS as early as possible so sync.nodes can reach an
-	// empty machine before the first node is attached.
-	o.tryStartWS(ctx)
+	// Configure the shared client before creating node services.
+	o.prepareWS()
 
 	// SB-RELAY-01: the embedded gost relay data plane runs alongside the
 	// nodes. It stays completely idle until the panel publishes a relay
 	// config for this machine and enables it there.
-	relayMgr := relay.NewManager(o.client, o.cfg.Machine.MachineID, o.cfg.Kernel.ConfigDir)
 	o.relayDone = make(chan struct{})
 	go func() {
 		defer close(o.relayDone)
-		relayMgr.Run(ctx)
+		relayMgr.RunWithGeneration(ctx)
 	}()
 
 	// Start initial nodes.
 	for _, n := range nodesResp.Nodes {
 		o.startNode(ctx, n)
 	}
+
+	// Initial mailboxes must exist before the panel sends the WS baseline.
+	o.startWS(ctx)
 
 	discoveryTicker := time.NewTicker(o.pullInterval)
 	statusTicker := time.NewTicker(o.pushInterval)
@@ -243,6 +261,7 @@ func (o *Orchestrator) stopAll() {
 
 	if o.wsCancel != nil {
 		o.wsCancel()
+		<-o.wsDone
 	}
 }
 
@@ -298,7 +317,7 @@ func (o *Orchestrator) reportMachineStatus() {
 
 // ─── WS mux ─────────────────────────────────────────────────────────────
 
-func (o *Orchestrator) tryStartWS(ctx context.Context) {
+func (o *Orchestrator) prepareWS() {
 	hs, err := o.client.Handshake()
 	if err != nil {
 		nlog.Core().Warn("machine ws handshake failed, REST only", "error", err)
@@ -326,10 +345,19 @@ func (o *Orchestrator) tryStartWS(ctx context.Context) {
 		o.onWSStatus,
 		nil, // per-node status is sent via machineNodePush
 	)
+}
 
+func (o *Orchestrator) startWS(ctx context.Context) {
+	if o.ws == nil {
+		return
+	}
 	wsCtx, wsCancel := context.WithCancel(ctx)
 	o.wsCancel = wsCancel
-	go o.ws.Run(wsCtx)
+	o.wsDone = make(chan struct{})
+	go func() {
+		defer close(o.wsDone)
+		o.ws.Run(wsCtx)
+	}()
 
 	nlog.Core().Info("machine: ws mux started")
 }
@@ -436,4 +464,10 @@ func (p *machineNodePush) SendDeviceReport(devices map[int][]string) {
 		return
 	}
 	p.ws.SendDeviceReportForNode(p.nodeID, devices)
+}
+
+func (p *machineNodePush) Session() uint64 { return p.ws.Session() }
+
+func (p *machineNodePush) SendDeviceReportForSession(devices map[int][]string, session uint64) {
+	p.ws.SendDeviceReportForSession(p.nodeID, devices, session)
 }

@@ -58,7 +58,7 @@ func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[st
 	if configSnapshot == nil {
 		return Bootstrap{}, fmt.Errorf("initial config is nil")
 	}
-	users, err := p.client.GetUsers()
+	users, err := p.client.GetUsersWithRevision(&bootstrap.UserRevision)
 	if err != nil {
 		return Bootstrap{}, fmt.Errorf("initial user fetch: %w", err)
 	}
@@ -66,6 +66,7 @@ func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[st
 	if err != nil {
 		return Bootstrap{}, fmt.Errorf("initial config normalize: %w", err)
 	}
+	bootstrap.ConfigRevision = configSnapshot.StateRevision
 	bootstrap.Users = model.UserSpecsFromPanel(users)
 	return bootstrap, nil
 }
@@ -83,7 +84,8 @@ func pollPanelSnapshot(ctx context.Context, client *panel.Client, kcfg config.Ke
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("poll config: %w", err)
 	}
-	users, err := client.GetUsers(&userETag)
+	var userRevision *uint64
+	users, err := client.GetUsersWithRevision(&userRevision, &userETag)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("poll users: %w", err)
 	}
@@ -96,7 +98,11 @@ func pollPanelSnapshot(ctx context.Context, client *panel.Client, kcfg config.Ke
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("poll config normalize: %w", err)
 	}
-	return Snapshot{Config: nodeSpec, Users: model.UserSpecsFromPanel(users), Commit: func(configApplied, usersApplied bool) {
+	var configRevision *uint64
+	if configSnapshot != nil {
+		configRevision = configSnapshot.StateRevision
+	}
+	return Snapshot{ConfigRevision: configRevision, UserRevision: userRevision, Config: nodeSpec, Users: model.UserSpecsFromPanel(users), Commit: func(configApplied, usersApplied bool) {
 		var configTag, userTag *string
 		if configApplied && configSnapshot != nil {
 			configTag = &configETag
@@ -186,7 +192,7 @@ func (p *PanelControlPlane) newPushClient(metricsFn func() map[string]interface{
 }
 
 func TranslateWSEvent(event panel.WSEvent, kcfg config.KernelConfig) (Event, error) {
-	translated := Event{Type: EventType(event.Type), DeltaAction: event.DeltaAction, DeviceUsers: event.DeviceUsers}
+	translated := Event{Session: event.Session, StateRevision: event.StateRevision, BaseRevision: event.BaseRevision, Type: EventType(event.Type), DeltaAction: event.DeltaAction, DeviceUsers: event.DeviceUsers}
 	if event.Config != nil {
 		var err error
 		translated.Config, err = model.NodeSpecFromPanelValidated(event.Config, kcfg)
@@ -207,6 +213,12 @@ func (p *panelPushClient) Run(ctx context.Context) { p.inner.Run(ctx) }
 func (p *panelPushClient) IsConnected() bool       { return p.inner.IsConnected() }
 func (p *panelPushClient) SendDeviceReport(devices map[int][]string) {
 	p.inner.SendDeviceReport(devices)
+}
+
+func (p *panelPushClient) Session() uint64 { return p.inner.Session() }
+
+func (p *panelPushClient) SendDeviceReportForSession(devices map[int][]string, session uint64) {
+	p.inner.SendDeviceReportForSession(0, devices, session)
 }
 
 func (p *panelPushClient) TakeDroppedEvents() bool { return p.dropped.Swap(false) }

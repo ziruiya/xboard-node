@@ -179,25 +179,24 @@ func TestApplyUserDeltaAddPreparesLimiterBeforeKernelUpdate(t *testing.T) {
 	s.updateUserState(oldUsers)
 
 	delta := []model.UserSpec{{ID: 2, UUID: "uuid-new", SpeedLimit: 8}}
-	k.onAddUsers = func(users []model.UserSpec) {
-		if len(users) != 1 || users[0].UUID != "uuid-new" {
-			t.Fatalf("unexpected users passed to AddUsers: %#v", users)
+	k.onUpdateUsers = func(users []model.UserSpec) {
+		if len(users) != 2 {
+			t.Fatalf("unexpected users passed to UpdateUsers: %#v", users)
 		}
 		if got := k.speedLimitFunc("uuid-new"); got == nil {
-			t.Fatal("expected delta user's limiter to be visible before kernel AddUsers")
+			t.Fatal("expected delta user's limiter to be visible before kernel UpdateUsers")
 		}
 	}
 
 	s.applyUserDelta(context.Background(), "add", delta)
 
-	if got := k.addCalls; got != 1 {
-		t.Fatalf("AddUsers call count = %d, want 1", got)
+	if got := k.updateCalls; got != 1 {
+		t.Fatalf("UpdateUsers call count = %d, want 1", got)
 	}
 	if s.speedTracker.GetLimiter("uuid-new") == nil {
 		t.Fatal("expected limiter for delta-added user after successful update")
 	}
 }
-
 
 func TestValidateNodeRuntimeRejectsUnsupportedDNSProvider(t *testing.T) {
 	cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox"}}

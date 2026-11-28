@@ -71,8 +71,8 @@ type MachineNode struct {
 
 // MachineNodesResponse is the response from GET /api/v2/server/machine/nodes.
 type MachineNodesResponse struct {
-	Nodes      []MachineNode      `json:"nodes"`
-	BaseConfig MachineBaseConfig  `json:"base_config"`
+	Nodes      []MachineNode     `json:"nodes"`
+	BaseConfig MachineBaseConfig `json:"base_config"`
 }
 
 // MachineBaseConfig holds polling intervals for machine mode.
@@ -83,6 +83,7 @@ type MachineBaseConfig struct {
 
 // NodeConfig is the response from GET /api/v1/server/UniProxy/config
 type NodeConfig struct {
+	StateRevision *uint64 `json:"-"`
 	// NodeID is populated in machine-mode WS events for routing.
 	NodeID          int                    `json:"node_id,omitempty"`
 	Protocol        string                 `json:"protocol"`
@@ -260,5 +261,6 @@ type User struct {
 }
 
 type UsersResponse struct {
-	Users []User `json:"users"`
+	StateRevision *uint64 `json:"state_revision"`
+	Users         []User  `json:"users"`
 }

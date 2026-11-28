@@ -63,26 +63,28 @@ type Service struct {
 	pushBackoff      apiBackoff // backoff for panel push failures
 
 	// pushDone is owned by the event loop. The sender closes it after committing its result.
-	pushDone        chan struct{}
-	restDevicesHash string
-	pullActive      atomic.Bool
+	pushDone   chan struct{}
+	pullActive atomic.Bool
 	// pullResults delivers async pullViaAPI results back to the main goroutine.
 	pullResults chan pullResult
 
 	wsClient        controlplane.PushClient        // Push client (nil if push is not enabled)
 	wsEvents        chan controlplane.Event        // receives data events from push transport
 	wsStatusCh      chan controlplane.StatusChange // receives push connectivity notifications
-	wsCancel        context.CancelFunc             // cancels the WS client goroutine
-	wsDisconnectAt  time.Time                      // when WS last disconnected (zero if connected)
+	wsDone          chan struct{}
+	wsCancel        context.CancelFunc // cancels the WS client goroutine
+	wsDisconnectAt  time.Time          // when WS last disconnected (zero if connected)
 	wsResyncPending bool
 	// Local WS observations are ordered independently for each resource.
-	resyncRevision       uint64
-	configRevision       uint64
-	userRevision         uint64
-	polledConfigRevision uint64
-	polledUserRevision   uint64
-	machineMailbox       *controlplane.NodeMailbox
-	machineMailboxCh     <-chan struct{}
+	resyncRevision                              uint64
+	appliedConfigRevision, appliedUserRevision  *uint64
+	wsSession, wsConfigBaseline, wsUserBaseline uint64
+	configRevision                              uint64
+	userRevision                                uint64
+	polledConfigRevision                        uint64
+	polledUserRevision                          uint64
+	machineMailbox                              *controlplane.NodeMailbox
+	machineMailboxCh                            <-chan struct{}
 
 	// metricsMu: lastUsers, lastConfig, wsClient, wsDisconnectAt (buildMetrics vs main loop).
 	metricsMu sync.RWMutex
@@ -105,6 +107,8 @@ type pullResult struct {
 	failed                                       bool
 	config                                       *model.NodeSpec
 	users                                        []model.UserSpec
+	panelConfigRevision, panelUserRevision       *uint64
+	wsSession                                    uint64
 	configHash                                   string
 	userHash                                     string
 }
@@ -236,6 +240,7 @@ func (s *Service) Run(ctx context.Context) error {
 	defer wsDiscoveryTicker.Stop()
 
 	s.startWSClient(ctx)
+	defer s.stopWSClient()
 	return s.runEvents(ctx, trackTicker, reportTicker, pullTicker, deviceReportTicker, wsDiscoveryTicker)
 }
 
@@ -266,7 +271,7 @@ func (s *Service) runEvents(ctx context.Context, trackTicker, reportTicker, pull
 			s.pushReportAsync(ctx)
 
 		case <-deviceReportTicker.C:
-			s.reportDevices()
+			s.sendDeviceBatch(ctx)
 
 		case <-pullTicker.C:
 			// When WebSocket is connected, skip REST polling entirely.
@@ -295,6 +300,7 @@ func (s *Service) runEvents(ctx context.Context, trackTicker, reportTicker, pull
 			s.drainMachineMailbox(ctx)
 
 		case event := <-s.wsEvents:
+			s.checkWSDrops(ctx)
 			s.handleWSEvent(ctx, event)
 		}
 	}
@@ -349,6 +355,7 @@ func (s *Service) initialSetup(ctx context.Context) error {
 	if !s.applyConfig(ctx, bootstrap.Config, computeConfigHash(bootstrap.Config), nil) {
 		return fmt.Errorf("apply initial configuration")
 	}
+	s.appliedConfigRevision, s.appliedUserRevision = bootstrap.ConfigRevision, bootstrap.UserRevision
 	nlog.Core().Info("initial snapshot ready", "protocol", bootstrap.Config.Protocol,
 		"port", bootstrap.Config.ServerPort, "users", len(bootstrap.Users))
 	s.markMailboxReadyAndDrain(ctx)
@@ -418,15 +425,28 @@ func (s *Service) startWSClient(ctx context.Context) {
 	}
 	wsCtx, wsCancel := context.WithCancel(ctx)
 	s.wsCancel = wsCancel
-	go s.wsClient.Run(wsCtx)
+	push := s.wsClient
+	done := make(chan struct{})
+	s.wsDone = done
+	go func() {
+		defer close(done)
+		push.Run(wsCtx)
+	}()
+}
+
+func (s *Service) stopWSClient() {
+	if s.wsCancel != nil {
+		s.wsCancel()
+		<-s.wsDone
+		s.wsCancel = nil
+	}
 }
 
 func (s *Service) markMailboxReadyAndDrain(ctx context.Context) {
 	if s.machineMailbox == nil {
 		return
 	}
-	// Seed mailbox with bootstrap state so delta events can be applied
-	// incrementally instead of always triggering REST reconciliation.
+	// Seed the mailbox before draining buffered panel events.
 	s.metricsMu.RLock()
 	users := s.lastUsers
 	config := s.lastConfig
@@ -449,6 +469,9 @@ func (s *Service) drainMachineMailbox(ctx context.Context) {
 	}
 	if state.HasDevices {
 		s.handleWSEvent(ctx, controlplane.Event{Type: controlplane.EventSyncDevices, DeviceUsers: state.DeviceUsers})
+	}
+	for _, event := range state.Events {
+		s.handleWSEvent(ctx, event)
 	}
 	if state.NeedsReconcile {
 		s.userRevision++
@@ -486,7 +509,7 @@ func (s *Service) wsMetrics() map[string]interface{} {
 // handleWSStatus reacts to WS connectivity changes.
 
 // - On disconnect: record timestamp, immediately REST poll.
-// - On reconnect: clear disconnect timestamp, REST poll to catch missed events.
+// - On reconnect: rebuild and report local devices, then reconcile panel state.
 func (s *Service) handleWSStatus(ctx context.Context, status controlplane.StatusChange) {
 	if status.NeedsResync {
 		s.requestWSResync(ctx, "drop_detected")
@@ -501,7 +524,7 @@ func (s *Service) handleWSStatus(ctx context.Context, status controlplane.Status
 		} else {
 			nlog.Core().Info("ws connected")
 		}
-		s.sendDeviceBatch()
+		s.sendDeviceBatch(ctx)
 		// After reconnect, proactively pull once to ensure we haven't missed
 		// any updates during the disconnection window.
 		s.requestWSResync(ctx, "ws_connected")
@@ -568,9 +591,7 @@ func (s *Service) wsDiscovery(ctx context.Context) {
 		}
 	} else if s.wsClient != nil {
 		nlog.Core().Info("push discovery: control plane disabled push, switching to polling")
-		if s.wsCancel != nil {
-			s.wsCancel()
-		}
+		s.stopWSClient()
 		s.metricsMu.Lock()
 		s.wsClient = nil
 		s.wsDisconnectAt = time.Time{}
@@ -581,19 +602,37 @@ func (s *Service) wsDiscovery(ctx context.Context) {
 
 // handleWSEvent processes data events received via WebSocket
 func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
+	if event.Session != 0 {
+		if event.Session < s.wsSession {
+			return
+		}
+		s.wsSession = event.Session
+	}
 	switch event.Type {
 	case controlplane.EventSyncConfig:
 		if event.Config == nil {
 			return
 		}
-		s.configRevision++
-		if !s.applyConfig(ctx, event.Config, computeConfigHash(event.Config), nil) {
-			s.requestWSResync(ctx, "config_apply_failed")
+		if revisionOlder(event.StateRevision, s.appliedConfigRevision) {
+			s.wsConfigBaseline = event.Session
+			return
 		}
+		s.configRevision++
+		hash := computeConfigHash(event.Config)
+		if (hash != s.lastConfigHash || s.configNeedsApply) && !s.applyConfig(ctx, event.Config, hash, nil) {
+			s.requestWSResync(ctx, "config_apply_failed")
+			return
+		}
+		s.appliedConfigRevision = event.StateRevision
+		s.wsConfigBaseline = event.Session
 
 	case controlplane.EventSyncUsers:
 		if event.Users == nil {
 			s.requestWSResync(ctx, "missing_user_snapshot")
+			return
+		}
+		if revisionOlder(event.StateRevision, s.appliedUserRevision) {
+			s.wsUserBaseline = event.Session
 			return
 		}
 		s.userRevision++
@@ -602,13 +641,31 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 			s.applyUserUpdate(ctx, event.Users, hash)
 			if hash != s.lastUserHash {
 				s.requestWSResync(ctx, "users_apply_failed")
+				return
 			}
 		}
+		s.appliedUserRevision = event.StateRevision
+		s.wsUserBaseline = event.Session
 
 	case controlplane.EventSyncUserDelta:
-		// The legacy wire event has no base revision. Reconcile with a full set.
 		s.userRevision++
-		s.requestWSResync(ctx, "unversioned_user_delta")
+		if event.BaseRevision == nil || event.StateRevision == nil || s.appliedUserRevision == nil ||
+			*event.BaseRevision != *s.appliedUserRevision || *event.StateRevision != *event.BaseRevision+1 ||
+			(event.Session != 0 && (s.wsConfigBaseline != event.Session || s.wsUserBaseline != event.Session)) {
+			s.requestWSResync(ctx, "user_delta_requires_snapshot")
+			return
+		}
+		if push, ok := s.wsClient.(controlplane.SessionDeviceReporter); ok && push.Session() != event.Session {
+			s.requestWSResync(ctx, "user_delta_from_old_session")
+			return
+		}
+		if !s.applyUserDelta(ctx, event.DeltaAction, event.DeltaUsers) {
+			s.appliedUserRevision = nil
+			s.lastUserHash = ""
+			s.requestWSResync(ctx, "user_delta_apply_failed")
+			return
+		}
+		s.appliedUserRevision = event.StateRevision
 
 	case controlplane.EventSyncDevices:
 		// Sync global device state
@@ -619,6 +676,10 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 	default:
 		nlog.Core().Debug(fmt.Sprintf("unknown ws event: %v", event.Type))
 	}
+}
+
+func revisionOlder(candidate, applied *uint64) bool {
+	return candidate != nil && applied != nil && *candidate < *applied
 }
 
 // pullViaAPIAsync fetches config/users from the panel API in a background
@@ -639,7 +700,7 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 
 	result := pullResult{
 		configRevision: s.configRevision, userRevision: s.userRevision,
-		resyncRevision: s.resyncRevision,
+		resyncRevision: s.resyncRevision, wsSession: s.wsSession,
 	}
 	pollCtx := ctx
 	if s.wsResyncPending || s.configRevision != s.polledConfigRevision || s.userRevision != s.polledUserRevision {
@@ -654,6 +715,7 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 		} else {
 			s.pullBackoff.onSuccess()
 			result.config, result.users, result.commit = snapshot.Config, snapshot.Users, snapshot.Commit
+			result.panelConfigRevision, result.panelUserRevision = snapshot.ConfigRevision, snapshot.UserRevision
 			if result.config != nil {
 				result.configHash = computeConfigHash(result.config)
 			}
@@ -676,8 +738,8 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 		return
 	}
 
-	configCurrent := result.configRevision == s.configRevision
-	usersCurrent := result.userRevision == s.userRevision
+	configCurrent := result.configRevision == s.configRevision && !revisionOlder(result.panelConfigRevision, s.appliedConfigRevision)
+	usersCurrent := result.userRevision == s.userRevision && !revisionOlder(result.panelUserRevision, s.appliedUserRevision)
 	configApplied, usersApplied := configCurrent, usersCurrent
 	usersChanged := usersCurrent && result.users != nil && result.userHash != s.lastUserHash
 	configChanged := configCurrent && result.config != nil && (result.configHash != s.lastConfigHash || s.configNeedsApply)
@@ -704,9 +766,22 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 	}
 	if configApplied {
 		s.polledConfigRevision = result.configRevision
+		if result.config != nil {
+			s.appliedConfigRevision = result.panelConfigRevision
+		}
 	}
 	if usersApplied {
 		s.polledUserRevision = result.userRevision
+		if result.users != nil {
+			s.appliedUserRevision = result.panelUserRevision
+		}
+	}
+
+	// A full, versioned REST reconciliation can also establish the baseline
+	// when the node attached after the shared connection's initial snapshots.
+	if configApplied && usersApplied && result.config != nil && result.users != nil &&
+		result.panelConfigRevision != nil && result.panelUserRevision != nil && result.wsSession == s.wsSession {
+		s.wsConfigBaseline, s.wsUserBaseline = s.wsSession, s.wsSession
 	}
 
 	if s.machineMailbox != nil {
@@ -861,105 +936,24 @@ func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, n
 	}
 }
 
-// applyUserDelta applies an incremental user change (add or remove) directly
-// via the kernel's atomic user API. Kernel updates run before updateUserState.
-func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers []model.UserSpec) {
+// applyUserDelta commits the candidate user set through the kernel's full-set update path.
+func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers []model.UserSpec) bool {
+	var users []model.UserSpec
 	switch action {
 	case "add":
-		// Defensive check for empty or nil deltaUsers
-		if deltaUsers == nil || len(deltaUsers) == 0 {
-			return
-		}
-		merged := mergeUsers(s.lastUsers, deltaUsers)
-
-		if !s.kernel.IsRunning() {
-			// NODE-012: same candidate-set rule as applyUserUpdate —
-			// a first user arriving as a delta on a node that started
-			// empty must start the kernel with the merged set, not be
-			// discarded for the stale set being empty.
-			s.startWithCandidateUsers(merged)
-			return
-		}
-
-		// NODE-013 (residual): the rotation pre-delete revokes the old
-		// credential ahead of the incremental add. Its result must be
-		// checked — silently ignoring a failed revoke would let this
-		// path claim success while the old credential stays valid. On
-		// failure, skip the incremental path entirely and converge
-		// through the full rebuild below.
-		preDeleteFailed := false
-		for _, delta := range deltaUsers {
-			for _, old := range s.lastUsers {
-				if old.ID == delta.ID && old.UUID != delta.UUID {
-					if _, err := s.kernel.RemoveUsers([]model.UserSpec{old}); err != nil {
-						nlog.Core().Warn(fmt.Sprintf("rotation pre-delete failed for user %d: %v, falling back to full rebuild", old.ID, err))
-						preDeleteFailed = true
-					}
-					break
-				}
-			}
-			if preDeleteFailed {
-				break
-			}
-		}
-
-		prevUsers, prevHash := s.prepareUserState(merged)
-		added := 0
-		incrementalOK := false
-		if !preDeleteFailed {
-			var err error
-			added, err = s.kernel.AddUsers(deltaUsers)
-			if err != nil {
-				nlog.Core().Warn(fmt.Sprintf("AddUsers failed: %v, falling back to full rebuild", err))
-			} else {
-				incrementalOK = true
-			}
-		}
-		if !incrementalOK {
-			// Trusted full rebuild: full-set sync first, then a full
-			// kernel restart. Both results are checked — if the
-			// restart also fails, restore the pre-change state rather
-			// than claiming a convergence that did not happen.
-			if _, _, err := s.kernel.UpdateUsers(merged); err != nil {
-				nlog.Core().Warn(fmt.Sprintf("UpdateUsers fallback failed: %v, restarting kernel", err))
-				if !s.startKernel(s.lastConfig, merged) {
-					s.restoreUserState(prevUsers, prevHash)
-					return
-				}
-			}
-		}
-		if s.nodeLog != nil && added > 0 {
-			s.nodeLog.Info(fmt.Sprintf("users added: +%d", added))
-		}
-
+		users = mergeUsers(s.lastUsers, deltaUsers)
 	case "remove":
-		// Defensive check for empty or nil deltaUsers
-		if deltaUsers == nil || len(deltaUsers) == 0 {
-			return
-		}
-		filtered := subtractUsers(s.lastUsers, deltaUsers)
-
-		if !s.kernel.IsRunning() {
-			return
-		}
-
-		prevUsers, prevHash := s.prepareUserState(filtered)
-		removed, err := s.kernel.RemoveUsers(deltaUsers)
-		if err != nil {
-			nlog.Core().Warn(fmt.Sprintf("RemoveUsers failed: %v, falling back to UpdateUsers", err))
-			if _, _, err := s.kernel.UpdateUsers(filtered); err != nil {
-				nlog.Core().Error(fmt.Sprintf("UpdateUsers fallback failed: %v", err))
-				s.restoreUserState(prevUsers, prevHash)
-				return
-			}
-		}
-		if s.nodeLog != nil && removed > 0 {
-			s.nodeLog.Info(fmt.Sprintf("users removed: -%d", removed))
-		}
-
+		users = subtractUsers(s.lastUsers, deltaUsers)
 	default:
 		nlog.Core().Warn(fmt.Sprintf("unknown user delta action: %s", action))
+		return false
 	}
+
+	hash := computeUserHash(users)
+	if hash != s.lastUserHash {
+		s.applyUserUpdate(ctx, users, hash)
+	}
+	return hash == s.lastUserHash
 }
 
 // mergeUsers overlays deltaUsers onto base (keyed by ID). New users are
@@ -1055,11 +1049,11 @@ func (s *Service) applyConfig(ctx context.Context, candidate *model.NodeSpec, ha
 	return true
 }
 
-func (s *Service) trackAndEnforce(ctx context.Context) {
+func (s *Service) trackAndEnforce(ctx context.Context) bool {
 	traffic, aliveIPs, connCount, err := s.kernel.GetUserTraffic(ctx)
 	if err != nil {
 		nlog.Core().Debug("get user traffic failed", "error", err)
-		return
+		return false
 	}
 
 	s.tracker.Process(traffic, aliveIPs, connCount)
@@ -1072,6 +1066,7 @@ func (s *Service) trackAndEnforce(ctx context.Context) {
 			nlog.TrackerStats(connCount, len(traffic))
 		}
 	}
+	return true
 }
 
 // pushReportAsync keeps slow HTTP off the event loop and starts at most one sender.
@@ -1086,7 +1081,7 @@ func (s *Service) pushReportAsync(ctx context.Context) {
 			return
 		}
 	}
-	if s.pushBackoff.shouldSkip() {
+	if s.pushBackoff.shouldSkip() || !s.trackAndEnforce(ctx) {
 		return
 	}
 	done := make(chan struct{})
@@ -1156,8 +1151,9 @@ func (s *Service) sendReport(ctx context.Context, batch *tracker.Batch) bool {
 		traffic = batch.Data
 		batchMeta = &controlplane.TrafficBatchMeta{BatchID: batch.ID, CollectedFrom: batch.CollectedFrom, CollectedTo: batch.CollectedTo}
 	}
-	aliveIPs, hash := s.tracker.AliveIPs()
-	if hash == s.restDevicesHash {
+	aliveIPs, _, count := s.tracker.AliveSnapshot()
+	if len(aliveIPs) == 0 && count > 0 {
+		// Keep reporting traffic while a live connection has no observable IP.
 		aliveIPs = nil
 	}
 	online := s.tracker.CurrentOnline()
@@ -1168,7 +1164,6 @@ func (s *Service) sendReport(ctx context.Context, batch *tracker.Batch) bool {
 		nlog.Core().Warn("failed to push report", "error", err)
 		return false
 	}
-	s.restDevicesHash = hash
 	nlog.ReportPushed(len(traffic), len(online))
 	return batch == nil || s.tracker.AckBatch(batch.ID)
 }
@@ -1285,17 +1280,32 @@ func computeUserHash(users []model.UserSpec) string {
 // ─── Device management ──────────────────────────────────────────────────
 
 // sendDeviceBatch reports local device snapshot to panel via WS.
-func (s *Service) sendDeviceBatch() {
+func (s *Service) sendDeviceBatch(ctx context.Context) {
 	if s.wsClient == nil {
 		return
 	}
-	devices, _ := s.tracker.AliveIPs()
-	s.sink.ReportDevices(s.wsClient, devices)
-}
-
-// reportDevices periodically reports device snapshot to panel.
-func (s *Service) reportDevices() {
-	s.sendDeviceBatch()
+	push, hasSession := s.wsClient.(controlplane.SessionDeviceReporter)
+	var session uint64
+	if hasSession {
+		session = push.Session()
+		if session == 0 {
+			return
+		}
+	} else if !s.wsClient.IsConnected() {
+		return
+	}
+	if !s.trackAndEnforce(ctx) {
+		return
+	}
+	devices, _, count := s.tracker.AliveSnapshot()
+	if len(devices) == 0 && count > 0 {
+		return
+	}
+	if hasSession {
+		push.SendDeviceReportForSession(devices, session)
+	} else {
+		s.sink.ReportDevices(s.wsClient, devices)
+	}
 }
 
 // ─── Runtime validation ─────────────────────────────────────────────────

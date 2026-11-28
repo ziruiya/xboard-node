@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/nlog"
@@ -27,11 +28,14 @@ const (
 
 // WSEvent is a parsed data event delivered to the service layer.
 type WSEvent struct {
-	Type        string
-	Config      *NodeConfig
-	Users       []User
-	DeltaAction string // "add" or "remove" (only for sync.user.delta)
-	DeltaUsers  []User // users affected by the delta
+	StateRevision *uint64
+	BaseRevision  *uint64
+	Session       uint64
+	Type          string
+	Config        *NodeConfig
+	Users         []User
+	DeltaAction   string // "add" or "remove" (only for sync.user.delta)
+	DeltaUsers    []User // users affected by the delta
 
 	// Device sync fields
 	DeviceUsers map[int][]string // userID -> IPs (for sync.devices)
@@ -97,13 +101,16 @@ type WSClientConfig struct {
 // WSClient connects to the panel's Workerman WS server using native WebSocket.
 // Authentication is done via query parameters (token + node_id) during the
 // WebSocket handshake — no separate auth step needed.
+var nextWSSession atomic.Uint64
+
 type WSClient struct {
-	wsURL    string // base WS URL, e.g. ws://panel.example.com:8076
-	token    string
-	nodeID   int
-	onEvent  func(WSEvent)
-	onStatus func(WSStatusChange)
-	onPing   func() map[string]interface{}
+	sessionID uint64 // owned by the connection reader
+	wsURL     string // base WS URL, e.g. ws://panel.example.com:8076
+	token     string
+	nodeID    int
+	onEvent   func(WSEvent)
+	onStatus  func(WSStatusChange)
+	onPing    func() map[string]interface{}
 
 	cfg WSClientConfig
 
@@ -144,9 +151,17 @@ func NewWSClient(wsURL string, token string, nodeID int, cfg WSClientConfig, onE
 }
 
 func (w *WSClient) IsConnected() bool {
+	return w.Session() != 0
+}
+
+// Session identifies the live connection, or is zero while disconnected.
+func (w *WSClient) Session() uint64 {
 	w.sessionMu.Lock()
 	defer w.sessionMu.Unlock()
-	return w.session != nil
+	if w.session == nil {
+		return 0
+	}
+	return w.sessionID
 }
 
 func (w *WSClient) enqueue(msg wsMessage) {
@@ -270,7 +285,8 @@ func (w *WSClient) serveConnection(ctx context.Context, conn *websocket.Conn, re
 	writeCh := make(chan wsMessage, 16)
 	w.sessionMu.Lock()
 	w.session = writeCh
-	w.wakeDevicesLocked()
+	w.sessionID = nextWSSession.Add(1)
+	clear(w.deviceSnapshots)
 	w.sessionMu.Unlock()
 	w.notifyStatus(true)
 	w.handleMessage(firstMsg)
@@ -400,6 +416,19 @@ func (w *WSClient) handleMessage(msg wsMessage) {
 func (w *WSClient) handleDataEvent(msg wsMessage) {
 	var event WSEvent
 	event.Type = msg.Event
+	event.Session = w.sessionID
+	if msg.Event == WSEventSyncConfig || msg.Event == WSEventSyncUsers || msg.Event == WSEventSyncUserDelta {
+		var revision struct {
+			StateRevision *uint64 `json:"state_revision"`
+			BaseRevision  *uint64 `json:"base_revision"`
+		}
+		if err := json.Unmarshal(msg.Data, &revision); err != nil {
+			nlog.Core().Warn("ws: cannot decode state revision", "error", err)
+			return
+		}
+		event.StateRevision = revision.StateRevision
+		event.BaseRevision = revision.BaseRevision
+	}
 
 	// Helper to unmarshal and decode with weak Typing
 	decodeData := func(data []byte, target interface{}) error {
@@ -512,12 +541,22 @@ func (w *WSClient) SendDeviceReport(devices map[int][]string) {
 // SendDeviceReportForNode sends a device report tagged with a specific node_id.
 // nodeID == 0 omits the field (legacy single-node mode).
 func (w *WSClient) SendDeviceReportForNode(nodeID int, devices map[int][]string) {
+	w.SendDeviceReportForSession(nodeID, devices, 0)
+}
+
+// SendDeviceReportForSession queues a snapshot only for the connection sampled by the caller.
+func (w *WSClient) SendDeviceReportForSession(nodeID int, devices map[int][]string, session uint64) {
 	if devices == nil {
 		devices = map[int][]string{}
 	}
-	var payload interface{} = devices
+	payload := map[string]interface{}{"alive_complete": true}
 	if nodeID > 0 {
-		payload = map[string]interface{}{"node_id": nodeID, "devices": devices}
+		payload["node_id"] = nodeID
+		payload["devices"] = devices
+	} else {
+		for uid, ips := range devices {
+			payload[strconv.Itoa(uid)] = ips
+		}
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -525,6 +564,9 @@ func (w *WSClient) SendDeviceReportForNode(nodeID int, devices map[int][]string)
 	}
 	w.sessionMu.Lock()
 	defer w.sessionMu.Unlock()
+	if session != 0 && (w.session == nil || w.sessionID != session) {
+		return
+	}
 	if !bytes.Equal(w.deviceSnapshots[nodeID], data) {
 		w.deviceSnapshots[nodeID] = data
 		w.wakeDevicesLocked()

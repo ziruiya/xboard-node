@@ -32,6 +32,15 @@ type batch2bPush struct{ controlplane.PushClient }
 
 func (batch2bPush) IsConnected() bool { return true }
 
+type liveDeviceKernel struct {
+	*fakeKernel
+	alive map[int]map[string]bool
+}
+
+func (k *liveDeviceKernel) GetUserTraffic(context.Context) (map[int][2]int64, map[int]map[string]bool, int, error) {
+	return nil, k.alive, len(k.alive), nil
+}
+
 func batch2bService(reports *batch2bReports) *Service {
 	s := newTestService(&fakeKernel{running: true})
 	s.tracker = tracker.New()
@@ -68,16 +77,17 @@ func TestBatch2BAsyncDeviceSnapshotIsIndependent(t *testing.T) {
 		}
 		return nil
 	}
-	s.tracker.Process(nil, map[int]map[string]bool{1: {"192.0.2.1": true}}, 1)
+	k := &liveDeviceKernel{fakeKernel: s.kernel.(*fakeKernel), alive: map[int]map[string]bool{1: {"192.0.2.1": true}}}
+	s.kernel = k
 	s.pushReportAsync(context.Background())
 	waitBatch2B(t, started)
 	close(release)
 	for i := 0; i < 200; i++ {
 		// Alternate snapshots so every legacy flush would rewrite the buffer.
-		s.tracker.Process(nil, map[int]map[string]bool{2: {"192.0.2.2": true}}, 1)
-		s.reportDevices()
-		s.tracker.Process(nil, map[int]map[string]bool{1: {"192.0.2.1": true}}, 1)
-		s.reportDevices()
+		k.alive = map[int]map[string]bool{2: {"192.0.2.2": true}}
+		s.sendDeviceBatch(context.Background())
+		k.alive = map[int]map[string]bool{1: {"192.0.2.1": true}}
+		s.sendDeviceBatch(context.Background())
 	}
 	waitBatch2B(t, s.pushDone)
 	select {
@@ -100,18 +110,19 @@ func TestBatch2BFailedRESTDeviceSnapshotRetriesIndependentlyOfWS(t *testing.T) {
 		return nil
 	}}
 	s := batch2bService(reports)
-	s.tracker.Process(nil, map[int]map[string]bool{1: {"192.0.2.1": true}}, 1)
+	s.kernel = &liveDeviceKernel{fakeKernel: s.kernel.(*fakeKernel), alive: map[int]map[string]bool{1: {"192.0.2.1": true}}}
 	ctx := context.Background()
+	s.trackAndEnforce(ctx)
 	if s.sendReport(ctx, nil) {
 		t.Fatal("failed report was accepted")
 	}
-	s.reportDevices()
+	s.sendDeviceBatch(ctx)
 	if !s.sendReport(ctx, nil) || !s.sendReport(ctx, nil) {
 		t.Fatal("REST retry did not succeed")
 	}
 	want := map[int][]string{1: {"192.0.2.1"}}
 	if len(reports.devices) != 1 || !reflect.DeepEqual(reports.devices[0], want) ||
-		!reflect.DeepEqual(attempts, []map[int][]string{want, want, nil}) {
+		!reflect.DeepEqual(attempts, []map[int][]string{want, want, want}) {
 		t.Fatalf("WS = %v, REST attempts = %v", reports.devices, attempts)
 	}
 }

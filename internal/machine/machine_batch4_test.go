@@ -18,14 +18,20 @@ import (
 
 func TestRunWaitsForRelayManagerOnShutdown(t *testing.T) {
 	mux := http.NewServeMux()
+	relayStarted := make(chan struct{}, 1)
 	mux.HandleFunc("/api/v2/server/machine/nodes", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"nodes":       []any{},
 			"base_config": map[string]any{"push_interval": 60, "pull_interval": 60},
 		})
 	})
-	// Everything else (handshake, relay config, ...) 404s: the
-	// orchestrator degrades to REST-only and the relay manager idles.
+	mux.HandleFunc("/api/v2/server/machine/relay/config", func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case relayStarted <- struct{}{}:
+		default:
+		}
+		http.NotFound(w, r)
+	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -36,12 +42,13 @@ func TestRunWaitsForRelayManagerOnShutdown(t *testing.T) {
 
 	o := New(cfg)
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- o.Run(ctx) }()
 
-	// Let discovery + relay startup complete.
-	time.Sleep(300 * time.Millisecond)
-	if o.relayDone == nil {
+	select {
+	case <-relayStarted:
+	case <-time.After(5 * time.Second):
 		t.Fatal("relay manager was not started")
 	}
 	cancel()

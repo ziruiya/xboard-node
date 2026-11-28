@@ -380,10 +380,17 @@ func (t *Tracker) FlushAliveIPs() map[int][]string {
 
 // AliveIPs returns an independently owned full snapshot and its content hash.
 func (t *Tracker) AliveIPs() (map[int][]string, string) {
-	alive := t.live.Load().aliveIPs
+	devices, hash, _ := t.AliveSnapshot()
+	return devices, hash
+}
+
+// AliveSnapshot pairs the device set with its sample's live connection count.
+func (t *Tracker) AliveSnapshot() (map[int][]string, string, int) {
+	snapshot := t.live.Load()
+	alive := snapshot.aliveIPs
 	devices := make(map[int][]string, len(alive))
 	if len(alive) == 0 {
-		return devices, ""
+		return devices, "", snapshot.connCount
 	}
 	userIDs := make([]int, 0, len(alive))
 	for uid := range alive {
@@ -408,7 +415,7 @@ func (t *Tracker) AliveIPs() (map[int][]string, string) {
 			h.Write([]byte{0})
 		}
 	}
-	return devices, hex.EncodeToString(h.Sum(nil))
+	return devices, hex.EncodeToString(h.Sum(nil)), snapshot.connCount
 }
 
 // CurrentOnline returns a snapshot copy of user_id → device count (distinct IPs).
