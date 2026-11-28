@@ -4,18 +4,23 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/experimental/cachefile"
 	"github.com/sagernet/sing-box/include"
 	singLog "github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/auth"
 	singJSON "github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/service"
+	"github.com/sagernet/sing/service/filemanager"
 	"golang.org/x/time/rate"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -36,6 +41,8 @@ const drainTimeout = 5 * time.Second
 type SingBox struct {
 	cfg       config.KernelConfig
 	outbounds []byte // serialized outbound configuration of the running instance
+	routes    []byte
+	cachePath string
 
 	platform adapter.PlatformInterface
 
@@ -66,7 +73,7 @@ type SingBox struct {
 
 	retiredTrackers map[*ConnTracker]map[string]int
 	retiring        sync.WaitGroup
-	retiredTraffic  map[int][2]int64 // folded once when a generation exits
+	traffic         trafficCounters
 }
 
 func New(cfg config.KernelConfig) *SingBox {
@@ -115,6 +122,11 @@ func (s *SingBox) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec
 		return fmt.Errorf("marshal outbounds: %w", err)
 	}
 
+	routes, err := json.Marshal(cfgMap["route"])
+	if err != nil {
+		return fmt.Errorf("marshal routes: %w", err)
+	}
+
 	nlog.Core().Debug("sing-box config generated", "len", len(data))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -136,6 +148,19 @@ func (s *SingBox) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec
 	oldTracker := s.connTracker
 	oldUsers := s.users
 
+	cachePath, stagedCache, err := s.stageReplacementCache(ctx, opts.Experimental)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("stage sing-box cache: %w", err)
+	}
+	if stagedCache != "" {
+		cancelContext := cancel
+		cancel = func() {
+			cancelContext()
+			_ = os.Remove(stagedCache)
+		}
+	}
+
 	instance, err := box.New(box.Options{
 		Context: ctx,
 		Options: opts,
@@ -147,7 +172,14 @@ func (s *SingBox) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec
 
 	// Fresh tracker on full restart.
 	tracker := NewConnTracker(0)
+	tracker.traffic = &s.traffic
 	tracker.SetUserMap(buildUserMap(users))
+	if oldTracker != nil {
+		oldTracker.globalMu.RLock()
+		tracker.globalDevices = oldTracker.globalDevices
+		tracker.globalLastUpdate = oldTracker.globalLastUpdate
+		oldTracker.globalMu.RUnlock()
+	}
 	if s.speedLimitFunc != nil {
 		tracker.SetSpeedLimitFunc(s.speedLimitFunc)
 	}
@@ -163,9 +195,17 @@ func (s *SingBox) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec
 		return fmt.Errorf("start sing-box: %w", err)
 	}
 
+	if stagedCache != "" {
+		if err := os.Rename(stagedCache, cachePath); err != nil {
+			nlog.Core().Warn("could not publish replacement sing-box cache", "error", err)
+		}
+	}
+
 	// New instance started successfully — swap state.
 	s.box = instance
 	s.outbounds = outbounds
+	s.routes = routes
+	s.cachePath = cachePath
 	s.ctx = ctx
 	s.cancel = cancel
 	s.users = users
@@ -183,10 +223,15 @@ func (s *SingBox) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec
 			s.retiredTrackers[oldTracker] = buildUserMap(oldUsers)
 			s.updateTrackerUsersLocked(users)
 		}
+		// Stop the old listener before returning so subsequent connections
+		// use the new router. Established TCP connections continue draining.
+		if im := service.FromContext[adapter.InboundManager](oldCtx); im != nil {
+			_ = im.Close()
+		}
 		s.retiring.Go(func() {
-			recycleOldBox(oldBox, oldCancel, oldCtx, oldTracker)
+			recycleOldBox(oldBox, oldCancel, oldTracker)
 			s.mu.Lock()
-			s.settleTrackerLocked(oldTracker)
+			delete(s.retiredTrackers, oldTracker)
 			s.mu.Unlock()
 		})
 	}
@@ -195,15 +240,47 @@ func (s *SingBox) startLocked(nodeConfig *model.NodeSpec, users []model.UserSpec
 	return nil
 }
 
-// recycleOldBox gracefully shuts down a previous sing-box instance in the
-// background. It closes listen sockets first, waits for connections to drain,
-// then hard-closes. This avoids blocking the new instance's startup.
-func recycleOldBox(oldBox *box.Box, oldCancel context.CancelFunc, oldCtx context.Context, oldTracker *ConnTracker) {
-	// Step 1: close listen sockets so no new connections arrive on old ports.
-	if im := service.FromContext[adapter.InboundManager](oldCtx); im != nil {
-		_ = im.Close()
+// stageReplacementCache snapshots the live database when both instances use
+// the same path. bbolt takes an exclusive lock for each open database.
+func (s *SingBox) stageReplacementCache(ctx context.Context, experimental *option.ExperimentalOptions) (path, staged string, err error) {
+	if experimental == nil || experimental.CacheFile == nil || !experimental.CacheFile.Enabled {
+		return "", "", nil
 	}
+	cache := experimental.CacheFile
+	path = cache.Path
+	if path == "" {
+		path = "cache.db"
+	}
+	path, err = filepath.Abs(filemanager.BasePath(ctx, path))
+	if err != nil || path != s.cachePath || s.ctx == nil {
+		return path, "", err
+	}
+	previous, ok := service.FromContext[adapter.CacheFile](s.ctx).(*cachefile.CacheFile)
+	if !ok || previous.DB == nil {
+		return path, "", fmt.Errorf("active cache database unavailable")
+	}
+	tx, err := previous.DB.Begin(false)
+	if err != nil {
+		return path, "", err
+	}
+	defer tx.Rollback()
+	temp, err := os.CreateTemp(filepath.Dir(path), ".sing-box-cache-*")
+	if err != nil {
+		return path, "", err
+	}
+	staged = temp.Name()
+	_, writeErr := tx.WriteTo(temp)
+	closeErr := temp.Close()
+	if writeErr != nil || closeErr != nil {
+		_ = os.Remove(staged)
+		return path, "", errors.Join(writeErr, closeErr)
+	}
+	cache.Path = staged
+	return path, staged, nil
+}
 
+// recycleOldBox waits for established connections before closing the old router.
+func recycleOldBox(oldBox *box.Box, oldCancel context.CancelFunc, oldTracker *ConnTracker) {
 	// Step 2: drain in-flight connections (best-effort).
 	if oldTracker != nil {
 		deadline := time.Now().Add(drainTimeout)
@@ -223,8 +300,7 @@ func recycleOldBox(oldBox *box.Box, oldCancel context.CancelFunc, oldCtx context
 	nlog.Core().Debug("sing-box: old instance recycled")
 }
 
-// Reload updates routing and inbounds in place when outbounds are unchanged.
-// An outbound change requires a replacement instance.
+// Reload replaces the instance when routing or outbounds change.
 func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
@@ -240,8 +316,19 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 	if err != nil {
 		return fmt.Errorf("marshal outbounds: %w", err)
 	}
-	if !bytes.Equal(s.outbounds, outbounds) {
-		return s.startLocked(nodeConfig, users, tls, cfgMap)
+	routes, err := json.Marshal(cfgMap["route"])
+	if err != nil {
+		return fmt.Errorf("marshal routes: %w", err)
+	}
+	routingChanged := !bytes.Equal(s.routes, routes)
+	if routingChanged || !bytes.Equal(s.outbounds, outbounds) {
+		if err := s.startLocked(nodeConfig, users, tls, cfgMap); err != nil {
+			if routingChanged {
+				return fmt.Errorf("reload sing-box routing: %w: %w", err, kernel.ErrReloadKeepsRunning)
+			}
+			return err
+		}
+		return nil
 	}
 	data, err := json.Marshal(cfgMap)
 	if err != nil {
@@ -262,12 +349,6 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 	if router == nil {
 		return fmt.Errorf("router not available")
 	}
-
-	// Update routing rules
-	if err := router.UpdateRules(opts.Route.Rules, opts.Route.RuleSet); err != nil {
-		return fmt.Errorf("reload sing-box routing: %w", err)
-	}
-	nlog.Core().Debug("sing-box routing reloaded")
 
 	if err := s.removeEmptyAuthInboundLocked(users); err != nil {
 		return err
@@ -420,7 +501,6 @@ func (s *SingBox) stop() {
 		s.cancel = nil
 	}
 	s.ctx = nil
-	s.settleTrackerLocked(s.connTracker)
 	s.connTracker = nil
 }
 
@@ -689,35 +769,11 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 func (s *SingBox) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	traffic = make(map[int][2]int64, len(s.retiredTraffic))
-	addTraffic(traffic, s.retiredTraffic)
-	if s.connTracker != nil {
-		var current map[int][2]int64
-		current, aliveIPs, connCount = s.connTracker.GetUserTraffic()
-		addTraffic(traffic, current)
+	if s.connTracker == nil {
+		return s.traffic.totals(), nil, 0, nil
 	}
-	for ct := range s.retiredTrackers {
-		addTraffic(traffic, ct.trafficTotals())
-	}
+	traffic, aliveIPs, connCount = s.connTracker.GetUserTraffic()
 	return traffic, aliveIPs, connCount, nil
-}
-
-func (s *SingBox) settleTrackerLocked(ct *ConnTracker) {
-	if ct == nil {
-		return
-	}
-	if s.retiredTraffic == nil {
-		s.retiredTraffic = make(map[int][2]int64)
-	}
-	addTraffic(s.retiredTraffic, ct.trafficTotals())
-	delete(s.retiredTrackers, ct)
-}
-
-func addTraffic(total, current map[int][2]int64) {
-	for uid, count := range current {
-		prev := total[uid]
-		total[uid] = [2]int64{prev[0] + count[0], prev[1] + count[1]}
-	}
 }
 
 // CloseConnection force-closes a specific connection by its ID.

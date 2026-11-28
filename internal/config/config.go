@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cedar2025/xboard-node/internal/nlog"
 	"golang.org/x/term"
@@ -19,14 +21,14 @@ import (
 )
 
 type Config struct {
-	InstanceID string `yaml:"-"`
-	Panel   PanelConfig   `yaml:"panel"`
-	Node    NodeConfig    `yaml:"node"`
-	Kernel  KernelConfig  `yaml:"kernel"`
-	Cert    CertConfig    `yaml:"cert"`
-	Log     LogConfig     `yaml:"log"`
-	Runtime RuntimeConfig `yaml:"runtime"`
-	WS      WSConfig      `yaml:"ws"`
+	InstanceID string        `yaml:"-"`
+	Panel      PanelConfig   `yaml:"panel"`
+	Node       NodeConfig    `yaml:"node"`
+	Kernel     KernelConfig  `yaml:"kernel"`
+	Cert       CertConfig    `yaml:"cert"`
+	Log        LogConfig     `yaml:"log"`
+	Runtime    RuntimeConfig `yaml:"runtime"`
+	WS         WSConfig      `yaml:"ws"`
 	// Standalone enables a local-only node that never contacts the panel.
 	Standalone *StandaloneConfig `yaml:"standalone,omitempty"`
 	// HealthPort enables a lightweight HTTP health-check endpoint on the
@@ -211,6 +213,9 @@ func LoadRoot(path string) (*RootConfig, error) {
 	// serve as defaults that each instance inherits. Instance-level settings
 	// take precedence over top-level ones.
 	if len(rc.Instances) > 0 {
+		if err := rc.Config.validateTimers(); err != nil {
+			return nil, fmt.Errorf("invalid config defaults: %w", err)
+		}
 		for i := range rc.Instances {
 			rc.Instances[i].inheritFrom(&rc.Config)
 		}
@@ -721,17 +726,50 @@ func (c *Config) validate() error {
 	}
 	switch c.Kernel.Type {
 	case "singbox", "xray":
+		if err := CheckKernelEnabled(c.Kernel.Type); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("kernel.type must be 'singbox' or 'xray', got '%s'", c.Kernel.Type)
 	}
 	if c.Cert.AutoTLS && c.Cert.Domain == "" {
 		return fmt.Errorf("cert.domain is required when cert.auto_tls is enabled")
 	}
-	if c.Node.PushInterval < 0 {
-		return fmt.Errorf("node.push_interval must not be negative")
+	return c.validateTimers()
+}
+
+// CheckKernelEnabled is shared by configured and transport-selected kernels.
+func CheckKernelEnabled(kernelType string) error {
+	if kernelType == "xray" {
+		return fmt.Errorf("xray kernel disabled by code gate: fix N1-01, N1-05, N1-06, N1-07 and N1-17 and pass review before enabling xray")
 	}
-	if c.Node.PullInterval < 0 {
-		return fmt.Errorf("node.pull_interval must not be negative")
+	return nil
+}
+
+func (c *Config) validateTimers() error {
+	timers := []struct {
+		field      string
+		seconds    int
+		maxSeconds int64
+	}{
+		{"node.push_interval", c.Node.PushInterval, math.MaxInt64 / int64(time.Second)},
+		{"node.pull_interval", c.Node.PullInterval, math.MaxInt64 / int64(time.Second)},
+		{"node.track_interval", c.Node.TrackInterval, math.MaxInt64 / int64(time.Second)},
+		{"node.device_report_interval", c.Node.DeviceReportInterval, math.MaxInt64 / int64(time.Second)},
+		{"ws.discovery_interval", c.WS.DiscoveryInterval, math.MaxInt64 / int64(time.Second)},
+		{"ws.status_interval", c.WS.StatusInterval, math.MaxInt64 / int64(time.Second)},
+		{"ws.handshake_timeout", c.WS.HandshakeTimeout, math.MaxInt64 / int64(time.Second)},
+		// The client adds up to 20% jitter and doubles backoff before capping it.
+		{"ws.backoff_initial", c.WS.BackoffInitial, math.MaxInt64 / int64(time.Second) / 2},
+		{"ws.backoff_max", c.WS.BackoffMax, math.MaxInt64 / int64(time.Second) / 2},
+	}
+	for _, timer := range timers {
+		if timer.seconds < 0 {
+			return fmt.Errorf("%s must not be negative", timer.field)
+		}
+		if int64(timer.seconds) > timer.maxSeconds {
+			return fmt.Errorf("%s exceeds the supported duration range", timer.field)
+		}
 	}
 	return nil
 }

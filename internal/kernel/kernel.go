@@ -4,12 +4,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 
 	"github.com/cedar2025/xboard-node/internal/model"
 	"golang.org/x/time/rate"
 )
+
+// ErrReloadKeepsRunning marks a rejected replacement whose previous kernel is still running.
+var ErrReloadKeepsRunning = errors.New("previous kernel remains running")
 
 type Capabilities struct {
 	PerUserSpeedLimit    bool

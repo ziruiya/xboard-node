@@ -25,6 +25,16 @@ type nodeHandle struct {
 	mailbox *controlplane.NodeMailbox
 }
 
+const (
+	initialNodeRetry = time.Second
+	maxNodeRetry     = time.Minute
+)
+
+type nodeRetry struct {
+	delay time.Duration
+	after time.Time
+}
+
 // Orchestrator manages all nodes bound to a panel machine. It:
 //   - discovers nodes via GET /machine/nodes
 //   - starts / stops Service instances as nodes are added / removed
@@ -34,8 +44,9 @@ type Orchestrator struct {
 	cfg    *config.Config
 	client *panel.Client // machine-level client (no node_id)
 
-	mu    sync.Mutex
-	nodes map[int]*nodeHandle // node_id → handle
+	mu      sync.Mutex
+	nodes   map[int]*nodeHandle // node_id → handle
+	retries map[int]nodeRetry
 
 	// Per-node mailbox keyed by node_id. Shared WS events are aggregated here
 	// and each node service drains the latest state when ready.
@@ -71,6 +82,7 @@ func New(cfg *config.Config) *Orchestrator {
 		cfg:                cfg,
 		client:             panel.NewClient(panelCfg),
 		nodes:              make(map[int]*nodeHandle),
+		retries:            make(map[int]nodeRetry),
 		mailboxes:          make(map[int]*controlplane.NodeMailbox),
 		statuses:           make(map[int]chan<- controlplane.StatusChange),
 		discoveryRequested: make(chan struct{}, 1),
@@ -158,21 +170,37 @@ func (o *Orchestrator) RunWithGeneration(ctx context.Context, relayMgr *relay.Ma
 
 func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 	o.mu.Lock()
-	if _, exists := o.nodes[mn.ID]; exists {
+	if o.nodes[mn.ID] != nil || ctx.Err() != nil || time.Now().Before(o.retries[mn.ID].after) {
 		o.mu.Unlock()
 		return
 	}
 
 	nodeCtx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
 	mb := controlplane.NewNodeMailbox()
-	o.nodes[mn.ID] = &nodeHandle{cancel: cancel, done: done, mailbox: mb}
-	o.mu.Unlock()
-
+	h := &nodeHandle{cancel: cancel, done: make(chan struct{}), mailbox: mb}
+	o.nodes[mn.ID] = h
 	o.eventsMu.Lock()
 	o.mailboxes[mn.ID] = mb
 	o.eventsMu.Unlock()
+	o.mu.Unlock()
 
+	ws := o.ws
+	nlog.Core().Info(fmt.Sprintf("machine: starting node %d (%s/%s)",
+		mn.ID, mn.Type, mn.Name))
+	go func() {
+		defer cancel()
+		err := o.runNode(nodeCtx, mn, mb, ws, func() {
+			o.mu.Lock()
+			defer o.mu.Unlock()
+			if o.nodes[mn.ID] == h {
+				delete(o.retries, mn.ID)
+			}
+		})
+		o.finishNode(nodeCtx, mn.ID, h, ws, err)
+	}()
+}
+
+func (o *Orchestrator) runNode(ctx context.Context, mn panel.MachineNode, mb *controlplane.NodeMailbox, ws *panel.WSClient, ready func()) error {
 	nodeCfg := o.cfg.ExpandMachineNode(mn.ID, mn.Type)
 
 	perNodeClient := o.client.ForNode(mn.ID)
@@ -181,7 +209,11 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 	// If the transport (e.g. xhttp) is incompatible with the configured kernel
 	// (e.g. singbox), auto-switch to the required kernel for this node.
 	if cfgSnapshot, err := perNodeClient.GetConfig(); err == nil && cfgSnapshot != nil {
-		if resolved := model.ResolveKernelForTransport(cfgSnapshot.Network, nodeCfg.Kernel.Type); resolved != nodeCfg.Kernel.Type {
+		resolved, err := model.ResolveKernelForTransport(cfgSnapshot.Network, nodeCfg.Kernel.Type)
+		if err != nil {
+			return err
+		}
+		if resolved != nodeCfg.Kernel.Type {
 			nlog.Core().Info(fmt.Sprintf("machine: auto-switching kernel for node %d (%s→%s, transport=%s)",
 				mn.ID, nodeCfg.Kernel.Type, resolved, cfgSnapshot.Network))
 			nodeCfg.Kernel.Type = resolved
@@ -191,7 +223,6 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 	perNodeClient.ResetConfigETag()
 
 	var push controlplane.PushClient
-	ws := o.ws
 	if ws != nil {
 		push = &machineNodePush{
 			nodeID: mn.ID,
@@ -210,36 +241,42 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 	cp := controlplane.NewMachinePanelControlPlane(perNodeClient, nodeCfg.Kernel, push, registerFn)
 	svc := service.NewWithControlPlane(nodeCfg, cp)
 
-	nlog.Core().Info(fmt.Sprintf("machine: starting node %d (%s/%s)",
-		mn.ID, mn.Type, mn.Name))
+	return svc.RunWithReady(ctx, ready)
+}
 
-	go func() {
-		defer close(done)
-		defer o.unregisterNode(mn.ID, mb)
-		if ws != nil {
-			defer ws.ForgetDeviceReportForNode(mn.ID)
-		}
-		if err := svc.Run(nodeCtx); err != nil {
-			nlog.Core().Error("machine node exited with error",
-				"node_id", mn.ID, "error", err)
-		}
-	}()
+func (o *Orchestrator) finishNode(ctx context.Context, nodeID int, h *nodeHandle, ws *panel.WSClient, err error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	defer close(h.done)
+	if o.nodes[nodeID] != h {
+		return
+	}
+	o.unregisterNode(nodeID, h.mailbox)
+	if ws != nil {
+		ws.ForgetDeviceReportForNode(nodeID)
+	}
+	delete(o.nodes, nodeID)
+	if ctx.Err() != nil {
+		return
+	}
+	delay := max(initialNodeRetry, min(o.retries[nodeID].delay*2, maxNodeRetry))
+	o.retries[nodeID] = nodeRetry{delay: delay, after: time.Now().Add(delay)}
+	nlog.Core().Error("machine node exited, retry deferred until discovery after backoff",
+		"node_id", nodeID, "retry_delay", delay, "error", err)
 }
 
 func (o *Orchestrator) stopNode(nodeID int) {
 	o.mu.Lock()
 	h, ok := o.nodes[nodeID]
+	delete(o.retries, nodeID)
 	if !ok {
 		o.mu.Unlock()
 		return
 	}
-	delete(o.nodes, nodeID)
+	h.cancel()
 	o.mu.Unlock()
 
-	o.unregisterNode(nodeID, h.mailbox)
-
 	nlog.Core().Info(fmt.Sprintf("machine: stopping node %d", nodeID))
-	h.cancel()
 	<-h.done
 }
 
@@ -283,6 +320,11 @@ func (o *Orchestrator) rediscover(ctx context.Context) {
 	}
 
 	o.mu.Lock()
+	for id := range o.retries {
+		if _, ok := wanted[id]; !ok {
+			delete(o.retries, id)
+		}
+	}
 	var toRemove []int
 	for id := range o.nodes {
 		if _, ok := wanted[id]; !ok {

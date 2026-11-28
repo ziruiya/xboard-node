@@ -55,11 +55,15 @@ func main() {
 	// Apply runtime memory tuning before anything else allocates.
 	applyRuntimeConfig(instances[0].Runtime)
 
-	runWithReload(rootCfg, *configPath)
+	if err := config.ValidateStartupLayout(instances); err != nil {
+		nlog.Core().Error("startup layout validation failed", "error", err)
+		os.Exit(1)
+	}
+	runWithReload(instances, *configPath)
 }
 
 // runWithReload restarts all node services when the config file changes.
-func runWithReload(initialRoot *config.RootConfig, configPath string) {
+func runWithReload(instances []*config.Config, configPath string) {
 	var healthSrv *http.Server
 	var healthPort int
 	startHealth := func(port int) {
@@ -93,17 +97,7 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		}
 	}()
 
-	for root := initialRoot; ; {
-		instances, err := root.NormalizeInstances()
-		if err != nil {
-			nlog.Core().Error("failed to normalize config", "error", err)
-			os.Exit(1)
-		}
-		if err := config.ValidateStartupLayout(instances); err != nil {
-			nlog.Core().Error("startup layout validation failed", "error", err)
-			os.Exit(1)
-		}
-
+	for {
 		// Preflight all generations before starting any instance in this process.
 		machines := make(map[*config.Config]*machine.Orchestrator)
 		managers := make(map[*config.Config]*relay.Manager)
@@ -130,9 +124,9 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-		reloadCh := make(chan *config.RootConfig, 1)
+		reloadCh := make(chan []*config.Config, 1)
 
-		watcher, err := config.WatchConfigRoot(ctx, configPath, func(newCfg *config.RootConfig) {
+		watcher, err := config.WatchConfigRoot(ctx, configPath, func(newCfg []*config.Config) {
 			select {
 			case reloadCh <- newCfg:
 			default:
@@ -217,9 +211,9 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		}
 		go func() { wg.Wait(); close(doneCh) }()
 
-		var newRoot *config.RootConfig
+		var newInstances []*config.Config
 		select {
-		case newRoot = <-reloadCh:
+		case newInstances = <-reloadCh:
 			nlog.Core().Info("config changed, restarting all services...")
 			cancel()
 			<-doneCh
@@ -234,7 +228,7 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 			watcher.Stop()
 		}
 
-		if newRoot == nil {
+		if newInstances == nil {
 			close(errCh)
 			if err := <-errCh; err != nil {
 				os.Exit(1)
@@ -243,14 +237,9 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 			return
 		}
 
-		newInstances, err := newRoot.NormalizeInstances()
-		if err != nil {
-			nlog.Core().Error("failed to normalize reloaded config", "error", err)
-			os.Exit(1)
-		}
 		config.InitLogger(newInstances[0].Log)
 		applyRuntimeConfig(newInstances[0].Runtime)
-		root = newRoot
+		instances = newInstances
 		nlog.Core().Info("reload complete, services restarting with new config")
 	}
 }

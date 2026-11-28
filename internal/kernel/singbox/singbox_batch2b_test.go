@@ -57,6 +57,8 @@ func TestBatch2BSingBoxTrafficAcrossReplacementAndDrain(t *testing.T) {
 		t.Fatal("old sing-box instance did not retire")
 	}
 	sample(3)
+	old.upload.Add(2) // A late copy callback can account bytes after retirement.
+	sample(2)
 	current.upload.Add(8)
 	s.Stop()
 	sample(8)

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -209,6 +210,15 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 }
 
 func (s *Service) Run(ctx context.Context) error {
+	return s.RunWithReady(ctx, nil)
+}
+
+// RunWithReady reports successful initialization before entering the event loop.
+func (s *Service) RunWithReady(ctx context.Context, ready func()) error {
+	if err := config.CheckKernelEnabled(s.cfg.Kernel.Type); err != nil {
+		return err
+	}
+
 	// Start cert manager (handles auto-TLS or manual cert verification)
 	if err := s.cert.Start(ctx); err != nil {
 		return fmt.Errorf("cert manager: %w", err)
@@ -218,6 +228,10 @@ func (s *Service) Run(ctx context.Context) error {
 	// Handshake: get WS config + initial data in one call
 	if err := s.initialSetup(ctx); err != nil {
 		return fmt.Errorf("initial setup: %w", err)
+	}
+
+	if ready != nil {
+		ready()
 	}
 
 	// Set up tickers
@@ -1024,6 +1038,13 @@ func (s *Service) applyConfig(ctx context.Context, candidate *model.NodeSpec, ha
 		reloaded := false
 		if s.kernel.IsRunning() {
 			if err := s.kernel.Reload(candidate, s.lastUsers, s.cert.TLSCert()); err != nil {
+				if errors.Is(err, kernel.ErrReloadKeepsRunning) {
+					nlog.Core().Warn("kernel replacement rejected, keeping current kernel", "error", err)
+					if users != nil {
+						s.restoreUserState(previousUsers, previousUserHash)
+					}
+					return false
+				}
 				nlog.Core().Warn("reload failed, restarting", "error", err)
 				// A partial Reload may already have removed the previous inbound.
 				s.kernel.Stop()

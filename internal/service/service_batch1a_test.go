@@ -162,3 +162,26 @@ func TestBatch1ARESTCommitsNeitherResourceWhenCombinedApplyFails(t *testing.T) {
 			configApplied, usersApplied, s.lastUsers)
 	}
 }
+
+type preservedKernel struct{ *fakeKernel }
+
+func (preservedKernel) Reload(*model.NodeSpec, []model.UserSpec, kernel.TLSCert) error {
+	return kernel.ErrReloadKeepsRunning
+}
+
+func TestRejectedKernelReplacementKeepsRunningConfig(t *testing.T) {
+	k := &fakeKernel{running: true}
+	s := newTestService(k)
+	s.cfg = &config.Config{}
+	s.kernel = preservedKernel{k}
+	previous := &model.NodeSpec{Protocol: "vless", ServerPort: 1234}
+	candidate := &model.NodeSpec{Protocol: "vless", ServerPort: 5678}
+	s.lastConfig, s.lastConfigHash = previous, computeConfigHash(previous)
+	s.updateUserState([]model.UserSpec{{ID: 1, UUID: "a"}})
+	if s.applyConfig(context.Background(), candidate, computeConfigHash(candidate), []model.UserSpec{{ID: 2, UUID: "b"}}) {
+		t.Fatal("rejected replacement was accepted")
+	}
+	if !k.running || k.startCalls != 0 || s.lastConfig != previous || len(s.lastUsers) != 1 || s.lastUsers[0].ID != 1 {
+		t.Fatal("rejected replacement changed the running kernel, config, or users")
+	}
+}

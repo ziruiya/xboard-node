@@ -28,12 +28,44 @@ var ipPool = sync.Pool{
 
 // ─── Per-user statistics ────────────────────────────────────────────────────
 
-// userStats holds per-user traffic counters and alive IP tracking.
-// Traffic counters are lock-free atomics (read on every packet).
-// IP tracking uses a lightweight mutex (only touched at connect/disconnect).
-type userStats struct {
+// trafficCounters are shared across successive routers for a single kernel.
+type trafficCounters struct {
+	mu    sync.Mutex
+	users map[int]*userTraffic
+}
+
+type userTraffic struct {
 	upload   atomic.Int64
 	download atomic.Int64
+}
+
+func (t *trafficCounters) forUser(uid int) *userTraffic {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.users == nil {
+		t.users = make(map[int]*userTraffic)
+	}
+	if t.users[uid] == nil {
+		t.users[uid] = new(userTraffic)
+	}
+	return t.users[uid]
+}
+
+func (t *trafficCounters) totals() map[int][2]int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	totals := make(map[int][2]int64, len(t.users))
+	for uid, counter := range t.users {
+		if up, down := counter.upload.Load(), counter.download.Load(); up > 0 || down > 0 {
+			totals[uid] = [2]int64{up, down}
+		}
+	}
+	return totals
+}
+
+// userStats combines shared counters with generation-local live connection state.
+type userStats struct {
+	*userTraffic
 
 	mu        sync.RWMutex   // RWMutex for concurrent reads
 	ips       map[string]int // sourceIP → refcount (number of active conns from that IP)
@@ -118,6 +150,7 @@ func (u *userStats) aliveIPList() map[string]bool {
 //   - Close callback to decrement IP refcounts
 //   - Per-connection rate limit token accumulation (amortized WaitN)
 type ConnTracker struct {
+	traffic *trafficCounters
 	usersMu sync.RWMutex
 	users   map[int]*userStats // userID → stats
 	uuidMap map[string]int     // UUID → userID (for lookup in RoutedConnection)
@@ -145,6 +178,7 @@ type connRef struct {
 
 func NewConnTracker(_ int) *ConnTracker {
 	return &ConnTracker{
+		traffic:       new(trafficCounters),
 		users:         make(map[int]*userStats),
 		uuidMap:       make(map[string]int),
 		connMap:       make(map[string]connRef),
@@ -180,7 +214,7 @@ func (t *ConnTracker) SetUserMap(m map[string]int) {
 	t.uuidMap = m
 	for _, uid := range m {
 		if _, ok := t.users[uid]; !ok {
-			t.users[uid] = &userStats{ips: make(map[string]int)}
+			t.users[uid] = &userStats{userTraffic: t.traffic.forUser(uid), ips: make(map[string]int)}
 		}
 	}
 	t.usersMu.Unlock()
@@ -444,15 +478,9 @@ func formatInt36(n int64) string {
 // This is O(users), not O(connections).
 func (t *ConnTracker) GetUserTraffic() (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int) {
 	t.usersMu.RLock()
-	traffic = make(map[int][2]int64, len(t.users))
+	traffic = t.traffic.totals()
 	aliveIPs = make(map[int]map[string]bool, len(t.users))
 	for uid, us := range t.users {
-		up := us.upload.Load()
-		down := us.download.Load()
-		if up > 0 || down > 0 {
-			traffic[uid] = [2]int64{up, down}
-		}
-
 		ips := us.aliveIPList()
 		if ips != nil {
 			aliveIPs[uid] = ips
@@ -464,19 +492,6 @@ func (t *ConnTracker) GetUserTraffic() (traffic map[int][2]int64, aliveIPs map[i
 	}
 	t.usersMu.RUnlock()
 	return
-}
-
-// trafficTotals reads only the cumulative counters of this instance.
-func (t *ConnTracker) trafficTotals() map[int][2]int64 {
-	t.usersMu.RLock()
-	defer t.usersMu.RUnlock()
-	totals := make(map[int][2]int64, len(t.users))
-	for uid, us := range t.users {
-		if up, down := us.upload.Load(), us.download.Load(); up > 0 || down > 0 {
-			totals[uid] = [2]int64{up, down}
-		}
-	}
-	return totals
 }
 
 // CloseByID force-closes a connection by its ID.

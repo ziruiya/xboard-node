@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -165,12 +166,9 @@ panel:
 kernel:
   type: xray
 `)
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.Kernel.Type != "xray" {
-		t.Errorf("kernel.type: got %q, want xray", cfg.Kernel.Type)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "xray kernel disabled by code gate") {
+		t.Fatalf("expected xray gate error, got %v", err)
 	}
 }
 
@@ -286,7 +284,7 @@ standalone:
     - id: 1
       uuid: "11111111-1111-1111-1111-111111111111"
 kernel:
-  type: xray
+  type: singbox
 cert:
   cert_mode: none
 `)
@@ -326,7 +324,6 @@ kernel:
 		t.Fatal("expected error for standalone mode without users")
 	}
 }
-
 
 func TestLoadRoot_LegacyConfigNormalizesToSingleInstance(t *testing.T) {
 	path := writeTemp(t, `
@@ -417,7 +414,7 @@ log:
   level: "debug"
   output: "stderr"
 kernel:
-  type: xray
+  type: singbox
   log_level: "error"
 node:
   push_interval: 42
@@ -449,8 +446,8 @@ instances:
 	if inst0.Log.Output != "stderr" {
 		t.Errorf("inst0 log.output: got %q, want %q", inst0.Log.Output, "stderr")
 	}
-	if inst0.Kernel.Type != "xray" {
-		t.Errorf("inst0 kernel.type: got %q, want %q", inst0.Kernel.Type, "xray")
+	if inst0.Kernel.Type != "singbox" {
+		t.Errorf("inst0 kernel.type: got %q, want %q", inst0.Kernel.Type, "singbox")
 	}
 	if inst0.Kernel.LogLevel != "error" {
 		t.Errorf("inst0 kernel.log_level: got %q, want %q", inst0.Kernel.LogLevel, "error")
@@ -469,8 +466,8 @@ instances:
 	if inst1.Log.Output != "stderr" {
 		t.Errorf("inst1 log.output: got %q, want %q", inst1.Log.Output, "stderr")
 	}
-	if inst1.Kernel.Type != "xray" {
-		t.Errorf("inst1 kernel.type: got %q, want %q", inst1.Kernel.Type, "xray")
+	if inst1.Kernel.Type != "singbox" {
+		t.Errorf("inst1 kernel.type: got %q, want %q", inst1.Kernel.Type, "singbox")
 	}
 }
 

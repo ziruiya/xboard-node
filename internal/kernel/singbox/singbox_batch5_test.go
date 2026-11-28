@@ -71,10 +71,10 @@ func TestBatch5ReloadChangesRunningOutboundManager(t *testing.T) {
 	}
 }
 
-func TestBatch5ReloadSurfacesRouterUpdateError(t *testing.T) {
+func TestBatch5ReloadSurfacesInvalidRouteError(t *testing.T) {
 	s, spec := batch5RunningSingBox(t)
 	spec.CustomRoutes = []map[string]any{{"ip_cidr": []string{"not-a-cidr"}, "outbound": "direct"}}
-	if err := s.Reload(&spec, nil, kernel.TLSCert{}); err == nil || !strings.Contains(err.Error(), "reload sing-box routing") {
-		t.Fatalf("expected an error from router.UpdateRules, got %v", err)
+	if err := s.Reload(&spec, nil, kernel.TLSCert{}); !errors.Is(err, kernel.ErrReloadKeepsRunning) || !strings.Contains(err.Error(), "reload sing-box routing") {
+		t.Fatalf("expected a route validation error, got %v", err)
 	}
 }

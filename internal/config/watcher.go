@@ -13,11 +13,11 @@ import (
 
 // Watcher reloads the config file on change (debounced) and calls onChange.
 type Watcher struct {
-	path         string
-	debounce     time.Duration
-	onChange     func(*Config)
-	onChangeRoot func(*RootConfig)
-	watcher      *fsnotify.Watcher
+	path              string
+	debounce          time.Duration
+	onChange          func(*Config)
+	onChangeInstances func([]*Config)
+	watcher           *fsnotify.Watcher
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -57,9 +57,8 @@ func WatchConfig(ctx context.Context, path string, onChange func(*Config)) (*Wat
 	return w, nil
 }
 
-
-// WatchConfigRoot watches path and reloads the root config model.
-func WatchConfigRoot(ctx context.Context, path string, onChange func(*RootConfig)) (*Watcher, error) {
+// WatchConfigRoot publishes normalized instances after validating their layout.
+func WatchConfigRoot(ctx context.Context, path string, onChange func([]*Config)) (*Watcher, error) {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
@@ -77,11 +76,11 @@ func WatchConfigRoot(ctx context.Context, path string, onChange func(*RootConfig
 	}
 
 	w := &Watcher{
-		path:         absPath,
-		debounce:     1 * time.Second,
-		onChangeRoot: onChange,
-		watcher:      fsw,
-		stopCh:       make(chan struct{}),
+		path:              absPath,
+		debounce:          1 * time.Second,
+		onChangeInstances: onChange,
+		watcher:           fsw,
+		stopCh:            make(chan struct{}),
 	}
 
 	go w.loop(ctx)
@@ -135,14 +134,21 @@ func (w *Watcher) reload() {
 	if w.stopped.Load() {
 		return
 	}
-	if w.onChangeRoot != nil {
+	if w.onChangeInstances != nil {
 		root, err := LoadRoot(w.path)
+		var instances []*Config
+		if err == nil {
+			instances, err = root.NormalizeInstances()
+		}
+		if err == nil {
+			err = ValidateStartupLayout(instances)
+		}
 		if err != nil {
 			nlog.Core().Error("config reload failed, keeping current config", "error", err)
 			return
 		}
 		nlog.Core().Info("config reloaded successfully")
-		w.onChangeRoot(root)
+		w.onChangeInstances(instances)
 		return
 	}
 	cfg, err := Load(w.path)

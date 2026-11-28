@@ -51,21 +51,24 @@ var singboxUnsupportedTransports = map[string]bool{
 func validateTransportKernel(network, kernelType string) error {
 	net := strings.ToLower(strings.TrimSpace(network))
 	if kernelType == "singbox" && singboxUnsupportedTransports[net] {
+		if _, err := ResolveKernelForTransport(net, kernelType); err != nil {
+			return err
+		}
 		return fmt.Errorf("transport %q is not supported by sing-box kernel; use xray kernel instead", net)
 	}
 	return nil
 }
 
-// ResolveKernelForTransport returns the kernel type required by the given
-// transport. If the configured kernel cannot handle the transport, it returns
-// the kernel that can. Otherwise it returns configuredKernel unchanged.
-// This is used in machine mode to auto-switch kernel per node.
-func ResolveKernelForTransport(network, configuredKernel string) string {
+// ResolveKernelForTransport checks whether the kernel required by a transport can run.
+func ResolveKernelForTransport(network, configuredKernel string) (string, error) {
 	net := strings.ToLower(strings.TrimSpace(network))
 	if configuredKernel == "singbox" && singboxUnsupportedTransports[net] {
-		return "xray"
+		configuredKernel = "xray"
 	}
-	return configuredKernel
+	if err := config.CheckKernelEnabled(configuredKernel); err != nil {
+		return "", fmt.Errorf("transport %q: %w", net, err)
+	}
+	return configuredKernel, nil
 }
 
 func normalizeKernelType(value string) (string, error) {
